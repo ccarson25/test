@@ -1,0 +1,5492 @@
+#######################################
+# PATH: app.py
+#######################################
+import dash
+from dash import html, dcc, Input, Output, State, ctx
+import dash_bootstrap_components as dbc
+import pandas as pd
+import sys
+import os
+from datetime import date, timedelta
+
+# --- Path Configuration ---
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+SCRAPER_DIR = os.path.join(BASE_DIR, "markets_data_scraper")
+MODULES_DIR = os.path.join(SCRAPER_DIR, "modules")
+
+sys.path.append(SCRAPER_DIR)
+sys.path.append(MODULES_DIR)
+
+try:
+    from database import init_db, SessionLocal
+    from models import EventRecord, CountryReference, HolidayRecord
+    from grid_factory import create_events_grid, create_holidays_grid
+    from default_logger import get_logger
+except ImportError as e:
+    print(f"CRITICAL: Backend modules missing. Error: {e}")
+    sys.exit(1)
+
+logger = get_logger(__name__)
+
+# --- Initialization ---
+logger.info("SYSTEM: Initializing Database Schema...")
+init_db()
+
+# --- Configuration ---
+CITI_SLATE = "#001632"
+CONTENT_WIDTH = "90%"
+
+app = dash.Dash(
+    __name__,
+    external_stylesheets=[dbc.themes.BOOTSTRAP],
+    suppress_callback_exceptions=True
+)
+app.title = "MARKETS EVENTS"
+
+app.index_string = f"""
+<!DOCTYPE html>
+<html>
+    <head>
+        {{%metas%}}
+        <title>MARKETS EVENTS</title>
+        {{%favicon%}}
+        {{%css%}}
+        <style>
+            html, body {{ height:100%; margin:0; padding:0; background:#F0F2F5; font-family: 'Segoe UI', sans-serif; }}
+            .app-wrapper {{ min-height:100vh; display:flex; flex-direction:column; }}
+            .control-card {{ border: none; box-shadow: 0 4px 15px rgba(0,0,0,0.05); border-radius: 8px; }}
+            .grid-card {{ border: none; box-shadow: 0 4px 6px rgba(0,0,0,0.1); border-radius: 8px; margin-bottom: 20px; }}
+            .custom-radio .form-check-input:checked {{ background-color: #0d6efd; border-color: #0d6efd; }}
+            .divider-col {{ border-right: 1px solid #e0e0e0; }}
+            .form-check-label {{ font-size: 0.9rem; color: #495057; }}
+            .DateInput_input {{ 
+                font-size: 0.95rem;
+                line-height: 20px; 
+                padding: 4px 8px; 
+                height: 30px; 
+            }}
+            .DateRangePickerInput__withBorder {{ border-radius: 4px; border: 1px solid #ced4da; }}
+        </style>
+    </head>
+    <body>
+        <div class="app-wrapper">
+            {{%app_entry%}}
+            <footer>
+                {{%config%}}
+                {{%scripts%}}
+                {{%renderer%}}
+            </footer>
+        </div>
+    </body>
+</html>
+"""
+
+
+# --- Helpers ---
+def get_currency_options():
+    session = SessionLocal()
+    try:
+        results = session.query(CountryReference.currency).order_by(
+            CountryReference.currency_priority.asc(),
+            CountryReference.currency.asc()
+        ).distinct().all()
+        return [r[0] for r in results if r[0]]
+    except Exception as e:
+        logger.error(f"Error fetching currencies: {e}")
+        return []
+    finally:
+        session.close()
+
+
+def get_start_of_week():
+    today = date.today()
+    days_since_sunday = (today.weekday() + 1) % 7
+    return today - timedelta(days=days_since_sunday)
+
+
+# --- Components ---
+def get_navbar(active_page="events"):
+    return dbc.Navbar(
+        dbc.Container(
+            [
+                dbc.NavbarBrand("MARKETS EVENTS", className="ms-2 fw-bold", style={"letterSpacing": "1px"}),
+                dbc.Nav(
+                    [
+                        dbc.NavItem(dbc.NavLink("Events Calendar", href="/", active=(active_page == "events"))),
+                        dbc.NavItem(dbc.NavLink("Holidays", href="/holidays", active=(active_page == "holidays"))),
+                    ],
+                    navbar=True, className="ms-auto"
+                )
+            ],
+            style={"max-width": CONTENT_WIDTH}
+        ),
+        color=CITI_SLATE, dark=True, className="mb-4 shadow-sm"
+    )
+
+
+# --- Layout Generators ---
+def serve_events_layout():
+    currency_opts = get_currency_options()
+    priority_currencies = currency_opts[:8] if len(currency_opts) >= 8 else currency_opts
+    sow = get_start_of_week()
+    eow = sow + timedelta(days=6)
+
+    return html.Div([
+        get_navbar("events"),
+        html.Div(
+            style={"max-width": CONTENT_WIDTH, "margin": "auto"},
+            children=[
+                dbc.Card([
+                    dbc.CardBody([
+                        html.Div(id="calendar-grid-container",
+                                 children=[dbc.Spinner(html.Div(style={"height": "600px"}), color="primary")])
+                    ], style={"padding": "0"})
+                ], className="grid-card"),
+
+                # Filter Panel
+                dbc.Card([
+                    dbc.CardBody([
+                        dbc.Row([
+                            dbc.Col([
+                                html.Label("DISPLAY OPTIONS", className="fw-bold mb-3 text-dark",
+                                           style={"fontSize": "0.85rem"}),
+                                dbc.RadioItems(
+                                    id="display-preset",
+                                    options=[
+                                        {"label": "View High Priority events for week (Sun-Sat)", "value": "week-high"},
+                                        {"label": "View High Priority events for next 10 days",
+                                         "value": "next-10-high"},
+                                        {"label": "View High/Med Priority events for current day",
+                                         "value": "day-mixed"},
+                                        {"label": "Custom Settings", "value": "custom"},
+                                    ],
+                                    value="week-high",
+                                    className="custom-radio mb-3", inputClassName="me-2"
+                                ),
+                                html.Div(id="custom-controls-container", children=[
+                                    html.Hr(className="my-3"),
+                                    dbc.Row([
+                                        dbc.Col([
+                                            html.Label("Date Range", className="fw-bold small text-muted mb-1"),
+                                            dcc.DatePickerRange(
+                                                id="date-filter", start_date=sow, end_date=eow,
+                                                display_format="YYYY-MM-DD",
+                                                className="d-block mb-3"
+                                            )
+                                        ], width=12),
+                                        dbc.Col([
+                                            html.Label("Impact Level", className="fw-bold small text-muted mb-1"),
+                                            dcc.Checklist(
+                                                id="impact-filter",
+                                                options=[
+                                                    {"label": " High (3)", "value": "3"},
+                                                    {"label": " Med (2)", "value": "2"},
+                                                    {"label": " Low (1)", "value": "1"},
+                                                ],
+                                                value=["3"], inline=True, inputClassName="form-check-input",
+                                                labelClassName="form-check-label me-3",
+                                                style={"display": "flex", "gap": "10px"}
+                                            )
+                                        ], width=12)
+                                    ])
+                                ], style={"display": "none"})
+                            ], width=5, className="divider-col pe-4"),
+
+                            dbc.Col([
+                                html.Label("CURRENCIES", className="fw-bold mb-2 text-dark",
+                                           style={"fontSize": "0.85rem"}),
+                                html.Div([
+                                    dbc.Checkbox(id="currency-select-all", label="Select All", value=False,
+                                                 class_name="d-inline-block small text-primary fw-bold me-3"),
+                                    dbc.Checkbox(id="currency-select-priority", label="Select Priority (G8)",
+                                                 value=True,
+                                                 class_name="d-inline-block small text-success fw-bold"),
+                                ], className="mb-2"),
+                                dcc.Dropdown(
+                                    id="currency-filter",
+                                    options=[{"label": c, "value": c} for c in currency_opts],
+                                    value=priority_currencies, multi=True, placeholder="Select Currencies...",
+                                    style={"fontSize": "0.9rem"}
+                                )
+                            ], width=7, className="ps-4")
+                        ])
+                    ])
+                ], className="control-card mt-3 p-3")
+            ]
+        )
+    ])
+
+
+def serve_holidays_layout():
+    today = date.today()
+    end_year = today + timedelta(days=365)
+
+    return html.Div([
+        get_navbar("holidays"),
+        html.Div(
+            style={"max-width": CONTENT_WIDTH, "margin": "auto"},
+            children=[
+                dbc.Card([
+                    dbc.CardBody([
+                        dbc.Row([
+                            dbc.Col([
+                                html.Label("HOLIDAY SCHEDULE", className="fw-bold mb-0 text-dark",
+                                           style={"fontSize": "1.2rem"}),
+                            ], width=8, className="d-flex align-items-center"),
+                            dbc.Col([
+                                dcc.DatePickerRange(
+                                    id="holiday-date-filter",
+                                    start_date=today,
+                                    end_date=end_year,
+                                    display_format="YYYY-MM-DD",
+                                    className="float-end"
+                                )
+                            ], width=4)
+                        ])
+                    ])
+                ], className="control-card mb-3 p-2"),
+
+                dbc.Card([
+                    dbc.CardBody([
+                        html.Div(id="holidays-grid-container",
+                                 children=[dbc.Spinner(html.Div(style={"height": "600px"}), color="primary")])
+                    ], style={"padding": "0"})
+                ], className="grid-card")
+            ]
+        )
+    ])
+
+
+# --- Router ---
+app.layout = html.Div([
+    dcc.Location(id="url", refresh=False),
+    html.Div(id="page-content")
+])
+
+
+@app.callback(Output("page-content", "children"), Input("url", "pathname"))
+def display_page(pathname):
+    if pathname == "/holidays":
+        return serve_holidays_layout()
+    else:
+        return serve_events_layout()
+
+
+# --- Holiday Page Callback (FIXED CURRENCY MAPPING) ---
+@app.callback(
+    Output("holidays-grid-container", "children"),
+    [Input("holiday-date-filter", "start_date"), Input("holiday-date-filter", "end_date")]
+)
+def update_holidays(start_date, end_date):
+    session = SessionLocal()
+    try:
+        query = session.query(HolidayRecord)
+        if start_date: query = query.filter(HolidayRecord.date_str >= start_date)
+        if end_date: query = query.filter(HolidayRecord.date_str <= end_date)
+
+        query = query.order_by(HolidayRecord.date_str.asc())
+        df = pd.read_sql(query.statement, session.bind)
+
+        if not df.empty:
+            # --- ADDED CURRENCY MAPPING HERE ---
+            country_refs = session.query(CountryReference).all()
+            country_map = {c.country_name.strip().lower(): c.currency for c in country_refs}
+
+            def safe_map(country_name):
+                if not country_name: return "UNK"
+                key = str(country_name).strip().lower()
+                return country_map.get(key, country_name)  # Fallback to country name
+
+            # Create the 'currency' column used by create_holidays_grid
+            df['currency'] = df['country'].apply(safe_map)
+
+        return create_holidays_grid(df)
+    except Exception as e:
+        logger.error(f"Holiday Grid Error: {e}")
+        return dbc.Alert(f"Error loading holidays: {e}", color="danger")
+    finally:
+        session.close()
+
+
+# --- Events Page Callbacks ---
+@app.callback(
+    [Output("custom-controls-container", "style"), Output("date-filter", "start_date"),
+     Output("date-filter", "end_date"), Output("impact-filter", "value")],
+    Input("display-preset", "value"),
+    [State("date-filter", "start_date"), State("date-filter", "end_date"), State("impact-filter", "value")]
+)
+def handle_display_presets(preset, current_start, current_end, current_impact):
+    today = date.today()
+    sow = get_start_of_week()
+    if preset == "custom": return {"display": "block",
+                                   "animation": "fadeIn 0.5s"}, dash.no_update, dash.no_update, dash.no_update
+    style = {"display": "none"}
+    if preset == "week-high":
+        return style, sow, sow + timedelta(days=6), ["3"]
+    elif preset == "next-10-high":
+        return style, today, today + timedelta(days=10), ["3"]
+    elif preset == "day-mixed":
+        return style, today, today, ["3", "2"]
+    return style, current_start, current_end, current_impact
+
+
+@app.callback(
+    [Output("currency-select-all", "value"), Output("currency-select-priority", "value"),
+     Output("currency-filter", "value")],
+    [Input("currency-select-all", "value"), Input("currency-select-priority", "value"),
+     Input("currency-filter", "value")],
+    State("currency-filter", "options")
+)
+def manage_currency_selection(select_all, select_priority, current_selection, options):
+    trigger_id = ctx.triggered_id
+    all_values = [opt["value"] for opt in options] if options else []
+    priority_values = all_values[:8] if len(all_values) >= 8 else all_values
+
+    if trigger_id == "currency-select-all": return (True, False, all_values) if select_all else (False, False, [])
+    if trigger_id == "currency-select-priority": return (False, True, priority_values) if select_priority else (False,
+                                                                                                                False,
+                                                                                                                [])
+    if not current_selection: return False, False, []
+
+    is_all = set(current_selection) == set(all_values)
+    is_priority = set(current_selection) == set(priority_values)
+    return is_all, is_priority, dash.no_update
+
+
+@app.callback(
+    Output("calendar-grid-container", "children"),
+    [Input("date-filter", "start_date"), Input("date-filter", "end_date"), Input("currency-filter", "value"),
+     Input("impact-filter", "value")]
+)
+def update_events_grid(start_date, end_date, currencies, impacts):
+    session = SessionLocal()
+    try:
+        # 1. FETCH EVENTS
+        query = session.query(EventRecord)
+        if start_date: query = query.filter(EventRecord.date >= start_date)
+        if end_date: query = query.filter(EventRecord.date <= end_date)
+        if currencies: query = query.filter(EventRecord.currency.in_(currencies))
+        if impacts: query = query.filter(EventRecord.impact.in_(impacts))
+
+        query = query.order_by(EventRecord.date.asc(), EventRecord.time_str.asc())
+        df_events = pd.read_sql(query.statement, session.bind)
+
+        # 2. FETCH HOLIDAYS
+        hol_query = session.query(HolidayRecord)
+        if start_date: hol_query = hol_query.filter(HolidayRecord.date_str >= start_date)
+        if end_date: hol_query = hol_query.filter(HolidayRecord.date_str <= end_date)
+
+        df_holidays = pd.read_sql(hol_query.statement, session.bind)
+
+        # 3. PROCESS & MERGE (Robust Mapping)
+        if not df_holidays.empty:
+            country_refs = session.query(CountryReference).all()
+            country_map = {c.country_name.strip().lower(): c.currency for c in country_refs}
+
+            def safe_map(country_name):
+                if not country_name: return "UNK"
+                key = str(country_name).strip().lower()
+                return country_map.get(key, country_name)
+
+            df_holidays['currency'] = df_holidays['country'].apply(safe_map)
+
+            if currencies:
+                df_holidays = df_holidays[df_holidays['currency'].isin(currencies)]
+
+            if not df_holidays.empty:
+                df_holidays_clean = pd.DataFrame({
+                    "date": df_holidays['date_str'],
+                    "time_str": "All Day",
+                    "currency": df_holidays['currency'],
+                    "impact": "Holiday",
+                    "title": "Holiday: " + df_holidays['title'],
+                    "actual": "", "forecast": "", "previous": "",
+                    "source": df_holidays['source'],
+                    "source_url": df_holidays['source_url']
+                })
+
+                if df_events.empty:
+                    df_events = df_holidays_clean
+                else:
+                    df_events = pd.concat([df_events, df_holidays_clean], ignore_index=True)
+
+        if df_events.empty:
+            return html.Div(dbc.Alert("No events found matching these filters.", color="info"), className="p-4")
+
+        return create_events_grid(df_events)
+    except Exception as e:
+        logger.error(f"Grid Update Error: {e}", exc_info=True)
+        return dbc.Alert(f"Error: {e}", color="danger")
+    finally:
+        session.close()
+
+
+if __name__ == "__main__":
+    app.run(host='0.0.0.0', port=8090, debug=True)
+
+#######################################
+# PATH: markets_data_scraper.log
+#######################################
+
+
+#######################################
+# PATH: requirements.txt
+#######################################
+# --- Dashboard & UI ---
+dash>=2.16.1                        # The core framework (includes Flask, html, dcc)
+dash-ag-grid>=31.2.0                # The Data Grid (You are on v32+)
+dash-bootstrap-components==1.6.0    # For dbc.Row, dbc.Col, themes
+diskcache==5.6.3                    # For background callback caching
+
+# --- Production Server ---
+waitress==2.1.2                     # The WSGI server used in app.py (serve(app.server))
+gunicorn==22.0.0
+
+# --- Database & Data Manipulation ---
+pandas==2.2.2                       # DataFrames for grid and manipulation
+sqlalchemy>=2.0.0                   # ORM for SQLite database interactions
+pytz~=2024.1                        # Timezone handling (UTC conversions)
+
+# --- Scraping & Networking ---
+requests~=2.32.2                    # For fetching HTML (investing.com)
+beautifulsoup4>=4.12.0              # For parsing HTML tags
+lxml                                # Faster parser for BeautifulSoup (highly recommended)
+urllib3                             # Used for Retry logic in scrapers
+
+
+
+#######################################
+# PATH: markets_data_scraper/default_logger.py
+#######################################
+import logging
+import logging.config
+import sys
+
+# --- LOGGING CONFIGURATION ---
+# Option A: Log to stdout (Console).
+# Best practice for Gunicorn/Docker environments.
+# We let the upstream process manager (Gunicorn/Systemd) handle file writing and rotation.
+
+LOGGING_CONFIG = {
+    'version': 1,
+    'disable_existing_loggers': False,
+    'formatters': {
+        'standard': {
+            'format': '%(asctime)s - %(process)d - %(levelname)s - %(module)s - %(message)s'
+        },
+    },
+    'handlers': {
+        'console': {
+            'level': 'INFO',
+            'class': 'logging.StreamHandler',
+            'stream': sys.stdout,  # Explicitly target stdout
+            'formatter': 'standard'
+        },
+    },
+    'loggers': {
+        '': {  # Root Logger
+            'handlers': ['console'],
+            'level': 'INFO',
+            'propagate': False
+        },
+        'gunicorn.error': {
+            'level': 'INFO',
+            'handlers': ['console'],
+            'propagate': False
+        },
+        'gunicorn.access': {
+            'level': 'INFO',
+            'handlers': ['console'],
+            'propagate': False
+        },
+    }
+}
+
+
+def configure_logging():
+    logging.config.dictConfig(LOGGING_CONFIG)
+
+
+def get_logger(name):
+    return logging.getLogger(name)
+
+
+configure_logging()
+logger = get_logger(__name__)
+
+#######################################
+# PATH: markets_data_scraper/modules/database.py
+#######################################
+import os
+from sqlalchemy import create_engine, event
+from sqlalchemy.orm import sessionmaker, scoped_session
+from sqlalchemy.pool import StaticPool
+
+# Ensure we use a persistent file path, relative to this script
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DB_PATH = os.path.join(BASE_DIR, "events.db")
+DB_URL = f"sqlite:///{DB_PATH}"
+
+# StaticPool is used for SQLite to prevent threading errors in Dash
+engine = create_engine(
+    DB_URL,
+    connect_args={"check_same_thread": False},
+    poolclass=StaticPool
+)
+
+# --- WAL MODE CONFIGURATION (Critical for Linux/Gunicorn) ---
+# Enables Write-Ahead Logging to allow simultaneous concurrent reads and writes.
+# Prevents "database is locked" errors.
+@event.listens_for(engine, "connect")
+def set_sqlite_pragma(dbapi_connection, connection_record):
+    cursor = dbapi_connection.cursor()
+    cursor.execute("PRAGMA journal_mode=WAL")
+    cursor.close()
+
+# Scoped session ensures each thread gets its own session
+SessionLocal = scoped_session(sessionmaker(autocommit=False, autoflush=False, bind=engine))
+
+def init_db():
+    """Helper to initialize tables."""
+    from models import Base
+    Base.metadata.create_all(bind=engine)
+
+#######################################
+# PATH: markets_data_scraper/modules/events_scraper.py
+#######################################
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+from bs4 import BeautifulSoup
+import time
+import random
+import sys
+import os
+from datetime import datetime
+from typing import List, Dict, Any
+
+# --- Logger Import ---
+try:
+    from .default_logger import get_logger
+except ImportError:
+    from default_logger import get_logger
+
+logger = get_logger(__name__)
+
+# --- CONFIGURATION ---
+DEFAULT_TIMEOUT = 30
+MAX_RETRIES = 3
+# CHANGE 1: Increased Backoff Factor to be more gentle on errors
+BACKOFF_FACTOR = 2
+STATUS_FORCELIST = [403, 429, 500, 502, 503, 504]
+
+# CHANGE 2: User-Agent Rotation List
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:122.0) Gecko/20100101 Firefox/122.0",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_2_1) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15"
+]
+
+def get_robust_session() -> requests.Session:
+    """Creates a session with retry logic and rotating User-Agents."""
+    session = requests.Session()
+
+    # CHANGE 2: Select a random User-Agent for this session
+    selected_ua = random.choice(USER_AGENTS)
+
+    session.headers.update({
+        "User-Agent": selected_ua,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+    })
+
+    retry_strategy = Retry(
+        total=MAX_RETRIES,
+        backoff_factor=BACKOFF_FACTOR,
+        status_forcelist=STATUS_FORCELIST,
+        allowed_methods=["POST", "GET"]
+    )
+    adapter = HTTPAdapter(max_retries=retry_strategy)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    return session
+
+
+def parse_investing_date(date_str: str) -> str:
+    """Parses 'Monday, January 12, 2026' into '2026-01-12'."""
+    try:
+        if "Waiting" in date_str: return ""
+        clean_str = date_str.strip()
+        dt = datetime.strptime(clean_str, "%A, %B %d, %Y")
+        return dt.strftime("%Y-%m-%d")
+    except ValueError:
+        return date_str
+
+
+def scrape_events(date_from: str, date_to: str, pages: int = 3) -> List[Dict[str, Any]]:
+    """
+    Scrapes economic events for a given date range.
+    Handles 'Preliminary' (P) and 'Revised' (R) icons aggressively.
+    """
+    base_url = "https://www.investing.com/economic-calendar/"
+    ajax_url = "https://www.investing.com/economic-calendar/Service/getCalendarFilteredData"
+
+    post_headers = {
+        "X-Requested-With": "XMLHttpRequest",
+        "Referer": base_url,
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Origin": "https://www.investing.com"
+    }
+
+    all_events = []
+    seen_pids = set()
+    current_sticky_date = ""
+
+    session = get_robust_session()
+
+    logger.info(f"Starting Events Scrape: {date_from} to {date_to}")
+
+    # --- STEP 1: WARM-UP SESSION ---
+    try:
+        logger.info("Warming up session (acquiring cookies)...")
+        session.get(base_url, timeout=DEFAULT_TIMEOUT)
+        # Slight pause after warm-up
+        time.sleep(random.uniform(1.0, 2.0))
+    except Exception as e:
+        logger.warning(f"Session warm-up warning (continuing anyway): {e}")
+
+    # --- STEP 2: SCRAPE PAGES ---
+    for page in range(pages):
+        payload = {
+            "dateFrom": date_from,
+            "dateTo": date_to,
+            "timeZone": "8",  # 8 = London/Europe
+            "currentTab": "custom",
+            "limit_from": str(page),
+            "submitFilters": "1"
+        }
+
+        try:
+            logger.info(f"Fetching Events Page {page}...")
+
+            response = session.post(ajax_url, data=payload, headers=post_headers, timeout=DEFAULT_TIMEOUT)
+            response.raise_for_status()
+
+            data_json = response.json()
+            html_fragment = data_json.get('data', '')
+
+            if not html_fragment:
+                logger.info("No HTML fragment returned. Stopping pagination.")
+                break
+
+            soup = BeautifulSoup(html_fragment, 'html.parser')
+            rows = soup.find_all("tr")
+
+            for row in rows:
+                row_classes = row.get("class", [])
+                row_id = str(row.get("id", ""))
+
+                # --- Date Logic ---
+                raw_date_text = ""
+                if 'theDay' in row_classes:
+                    raw_date_text = row.get_text(strip=True)
+                elif "dateHeader" in row_id:
+                    raw_date_text = row.get_text(strip=True)
+                else:
+                    date_cell = row.find("td", class_="theDay")
+                    if date_cell:
+                        raw_date_text = date_cell.get_text(strip=True)
+
+                if raw_date_text:
+                    current_sticky_date = parse_investing_date(raw_date_text)
+                    continue
+
+                # --- Event Logic ---
+                if 'js-event-item' in row_classes:
+                    pid = row.get("id", "").replace("eventRowId_", "")
+                    if pid and pid not in seen_pids:
+                        seen_pids.add(pid)
+
+                        # Clean Impact
+                        raw_impact = "1"
+                        sentiment_td = row.find("td", class_="sentiment")
+                        if sentiment_td:
+                            img_key = sentiment_td.get("data-img_key", "")
+                            clean_impact = img_key.replace("bull", "").replace("grayFull", "0")
+                            if clean_impact.isdigit():
+                                raw_impact = clean_impact
+
+                        def get_text_safe(class_name):
+                            el = row.find("td", class_=class_name)
+                            return el.get_text(strip=True) if el else ""
+
+                        # --- ROBUST TITLE LOGIC ---
+                        title_cell = row.find("td", class_="event")
+                        title_text = "N/A"
+
+                        if title_cell:
+                            title_text = title_cell.get_text(strip=True)
+                            spans = title_cell.find_all("span")
+                            is_prelim = False
+                            is_revised = False
+
+                            for span in spans:
+                                txt = span.get_text(strip=True)
+                                classes = span.get("class", [])
+                                if txt == "P" or "smallGrayP" in classes:
+                                    is_prelim = True
+                                if txt == "R" or "smallGrayR" in classes:
+                                    is_revised = True
+
+                            if is_prelim:
+                                if "(Preliminary)" not in title_text:
+                                    if title_text.startswith("P "): title_text = title_text[2:]
+                                    title_text = f"(Preliminary) {title_text}"
+
+                            if is_revised:
+                                if "(Revised)" not in title_text:
+                                    if title_text.startswith("R "): title_text = title_text[2:]
+                                    title_text = f"(Revised) {title_text}"
+
+                        all_events.append({
+                            "pid": pid,
+                            "date": current_sticky_date,
+                            "title": title_text,
+                            "impact_raw": raw_impact,
+                            "currency": row.find("td", class_="flagCur").get_text(strip=True) if row.find("td", class_="flagCur") else "",
+                            "actual": get_text_safe("bold"),
+                            "forecast": get_text_safe("fore"),
+                            "previous": get_text_safe("prev"),
+                            "time_raw": get_text_safe("js-time")
+                        })
+
+            # CHANGE 3: Increased Jitter
+            # Increased lower bound to 2.0s and upper bound to 5.0s to be safer
+            time.sleep(random.uniform(2.0, 5.0))
+
+        except requests.exceptions.RetryError:
+            logger.critical(f"CRITICAL: Max retries exceeded for Page {page}. Site may be blocking bot.")
+            break
+        except Exception as e:
+            logger.error(f"Event scrape failed on page {page}: {e}")
+            break
+
+    logger.info(f"Scrape Complete. Total Events Found: {len(all_events)}")
+    return all_events
+
+#######################################
+# PATH: markets_data_scraper/modules/grid_factory.py
+#######################################
+import dash_ag_grid as dag
+import pandas as pd
+from dash import html
+import dash_bootstrap_components as dbc
+
+
+def create_events_grid(df):
+    """
+    Generates the Main Events Grid (Home Page).
+
+    Features:
+    - Smart Date Sort: Sorts by Date+Time, Displays Date.
+    - Merged View: Shows Economic Events AND Holidays together.
+    - Styling: High Priority = Dark Blue; Holidays = Dark Blue + Light Grey Italic Text.
+    - Source Column: Markdown links.
+    """
+
+    # --- 1. DATA CLEANING ---
+    if not df.empty:
+        # SMART DATE SORT LOGIC
+        # If time is 'All Day', treat it as '00:00' so it sorts to the top of the day.
+        df['sort_time'] = df['time_str'].apply(lambda x: "00:00" if x == "All Day" else x)
+        df['full_timestamp'] = df['date'].astype(str) + " " + df['sort_time'].astype(str)
+
+        if 'impact' in df.columns:
+            df['impact'] = df['impact'].astype(str).str.strip()
+            priority_map = {
+                "3": "High", "2": "Medium", "1": "Low",
+                "0": "Low", "Non": "Low",
+                "Holiday": "Holiday"
+            }
+            df['impact'] = df['impact'].map(priority_map).fillna("Low")
+
+        # FORMAT SOURCE AS MARKDOWN LINK
+        if 'source' in df.columns and 'source_url' in df.columns:
+            df['source_md'] = "[" + df['source'] + "](" + df['source_url'] + ")"
+        else:
+            df['source_md'] = ""
+
+    # --- 2. DEFINE COLUMNS ---
+    column_defs = [
+        {
+            "field": "full_timestamp",
+            "headerName": "Date",
+            "width": 120,
+            "suppressSizeToFit": True,
+            "valueFormatter": {"function": "params.value ? params.value.split(' ')[0] : ''"}
+        },
+        {"field": "time_str", "headerName": "Time", "width": 90, "suppressSizeToFit": True},
+        {"field": "currency", "headerName": "Cur", "width": 80, "suppressSizeToFit": True},
+        {"field": "impact", "headerName": "Impact", "width": 100, "suppressSizeToFit": True},
+
+        # EVENT TITLE (Flex)
+        {
+            "field": "title",
+            "headerName": "Event",
+            "minWidth": 250,
+            "filter": "agTextColumnFilter"
+        },
+
+        {"field": "actual", "headerName": "Act", "width": 90, "suppressSizeToFit": True},
+        {"field": "forecast", "headerName": "Fcst", "width": 90, "suppressSizeToFit": True},
+        {"field": "previous", "headerName": "Prev", "width": 90, "suppressSizeToFit": True},
+
+        # SOURCE (Markdown)
+        {
+            "field": "source_md",
+            "headerName": "Source",
+            "width": 140,
+            "suppressSizeToFit": True,
+            "cellRenderer": "markdown",
+            "linkTarget": "_blank"
+        }
+    ]
+
+    # --- 3. STYLING LOGIC ---
+    row_style_logic = {
+        "styleConditions": [
+            {"condition": "params.data.impact == 'High'", "style": {"backgroundColor": "#001632", "color": "#FFFFFF"}},
+            {"condition": "params.data.impact == 'Medium'",
+             "style": {"backgroundColor": "#2D3959", "color": "#FFFFFF"}},
+            {"condition": "params.data.impact == 'Low'", "style": {"backgroundColor": "#405280", "color": "#FFFFFF"}},
+
+            # Holiday: Dark Blue Background (Matches High) + Light Grey Italic Text
+            {"condition": "params.data.impact == 'Holiday'", "style": {
+                "backgroundColor": "#001632",
+                "color": "#B0BEC5",
+                "fontStyle": "italic",
+            }},
+        ]
+    }
+
+    # --- 4. RETURN THE GRID ---
+    return dag.AgGrid(
+        id="events-grid-main",
+        rowData=df.to_dict("records"),
+        columnDefs=column_defs,
+        columnSize="sizeToFit",
+        defaultColDef={
+            "resizable": True,
+            "sortable": True,
+            "filter": True
+        },
+        className="ag-theme-alpine",
+        getRowStyle=row_style_logic,
+        dashGridOptions={
+            "pagination": True,
+            "paginationPageSize": 20,
+            "domLayout": "autoHeight",
+            "rowSelection": "single",
+            "animateRows": False,
+            "initialState": {
+                "sort": {
+                    "sortModel": [{"colId": "full_timestamp", "sort": "asc"}]
+                }
+            }
+        },
+        style={"width": "100%"}
+    )
+
+
+def create_holidays_grid(df):
+    """
+    Generates the Dedicated Holiday Grid (/holidays page).
+    Simple, clean layout with Country/Market columns.
+    """
+    if df.empty:
+        return html.Div(dbc.Alert("No holidays found for this period.", color="info"), className="p-3")
+
+    # Source Link Logic
+    if 'source' in df.columns and 'source_url' in df.columns:
+        df['source_md'] = "[" + df['source'] + "](" + df['source_url'] + ")"
+    else:
+        df['source_md'] = ""
+
+    column_defs = [
+        {"field": "date_str", "headerName": "Date", "width": 120, "sortable": True, "filter": True},
+        {"field": "currency", "headerName": "Currency", "width": 100, "sortable": True, "filter": True},
+        {"field": "country", "headerName": "Country", "width": 150, "sortable": True, "filter": True},
+        {"field": "market", "headerName": "Exchange / Market", "width": 200, "sortable": True, "filter": True},
+        {"field": "status", "headerName": "Status", "width": 120, "sortable": True},
+
+        # Flex column for the Holiday Name
+        {"field": "title", "headerName": "Holiday Name", "flex": 1, "minWidth": 200, "filter": "agTextColumnFilter"},
+
+        # Source Column
+        {
+            "field": "source_md",
+            "headerName": "Source",
+            "width": 140,
+            "cellRenderer": "markdown",
+            "linkTarget": "_blank"
+        }
+    ]
+
+    # Dark Theme Styling for Holidays Page
+    row_style_logic = {
+        "styleConditions": [
+            {"condition": "true", "style": {"backgroundColor": "#001632", "color": "#FFFFFF"}}
+        ]
+    }
+
+    return dag.AgGrid(
+        id="holidays-grid-dedicated",
+        rowData=df.to_dict("records"),
+        columnDefs=column_defs,
+        columnSize="sizeToFit",
+        defaultColDef={"resizable": True, "sortable": True, "filter": True},
+        className="ag-theme-alpine",
+        getRowStyle=row_style_logic,
+        dashGridOptions={
+            "pagination": True,
+            "paginationPageSize": 20,
+            "domLayout": "autoHeight",
+            "animateRows": False,
+        },
+        style={"width": "100%"}
+    )
+
+#######################################
+# PATH: markets_data_scraper/modules/holiday_scraper.py
+#######################################
+#######################################
+# PATH: markets_data_scraper/modules/holiday_scraper.py
+#######################################
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+from bs4 import BeautifulSoup
+import time
+import random
+import sys
+import os
+from datetime import datetime, date, timedelta
+from typing import List, Dict, Any, Tuple
+
+try:
+    from .default_logger import get_logger
+except ImportError:
+    from default_logger import get_logger
+
+logger = get_logger(__name__)
+
+# --- CONFIGURATION ---
+DEFAULT_TIMEOUT = 30
+MAX_RETRIES = 3
+BACKOFF_FACTOR = 1
+STATUS_FORCELIST = [403, 429, 500, 502, 503, 504]
+
+
+def get_robust_session() -> requests.Session:
+    """Creates a session with retry logic and standard browser headers."""
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Origin": "https://www.investing.com",
+        "Referer": "https://www.investing.com/holiday-calendar/"
+    })
+
+    retry_strategy = Retry(
+        total=MAX_RETRIES,
+        backoff_factor=BACKOFF_FACTOR,
+        status_forcelist=STATUS_FORCELIST,
+        allowed_methods=["POST", "GET"]
+    )
+    adapter = HTTPAdapter(max_retries=retry_strategy)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    return session
+
+
+def parse_investing_date(date_str: str) -> str:
+    """Parses dates like 'Jan 01, 2026' -> '2026-01-01'."""
+    clean_str = date_str.strip()
+    try:
+        # Format: Jan 01, 2026
+        dt = datetime.strptime(clean_str, "%b %d, %Y")
+        return dt.strftime("%Y-%m-%d")
+    except ValueError:
+        pass
+    try:
+        # Format: Monday, January 1, 2026
+        dt = datetime.strptime(clean_str, "%A, %B %d, %Y")
+        return dt.strftime("%Y-%m-%d")
+    except ValueError:
+        pass
+    return ""
+
+
+def get_date_chunks(start_date: date, end_date: date, chunk_days: int = 30) -> List[Tuple[str, str]]:
+    """
+    Splits a large date range into smaller chunks (e.g., 30 days) to bypass pagination limits.
+    Returns a list of (start_str, end_str) tuples.
+    """
+    chunks = []
+    current = start_date
+    while current < end_date:
+        chunk_end = min(current + timedelta(days=chunk_days), end_date)
+        chunks.append((current.strftime("%Y-%m-%d"), chunk_end.strftime("%Y-%m-%d")))
+        # Move to next day after chunk_end to avoid overlap
+        current = chunk_end + timedelta(days=1)
+    return chunks
+
+
+def scrape_holidays() -> List[Dict[str, Any]]:
+    """
+    Scrapes market holidays using DATE CHUNKING.
+    Instead of asking for a full year and failing to paginate,
+    we ask for 30 days at a time.
+    """
+
+    # 1. Define Range: Today - 10 days to + 365 days
+    today = date.today()
+    start_date = today - timedelta(days=10)
+    end_date = start_date + timedelta(days=365)
+
+    # 2. Split into 1-month chunks
+    date_chunks = get_date_chunks(start_date, end_date, chunk_days=30)
+
+    base_url = "https://www.investing.com/holiday-calendar/"
+    ajax_url = "https://www.investing.com/holiday-calendar/Service/getCalendarFilteredData"
+
+    post_headers = {
+        "X-Requested-With": "XMLHttpRequest",
+        "Content-Type": "application/x-www-form-urlencoded",
+    }
+
+    session = get_robust_session()
+    all_holidays = []
+
+    logger.info(f"--- Starting Holiday Scrape ({start_date} to {end_date}) ---")
+    logger.info(f"Strategy: Date Chunking ({len(date_chunks)} chunks of ~30 days)")
+
+    # 3. Warm up session
+    try:
+        session.get(base_url, timeout=DEFAULT_TIMEOUT)
+        time.sleep(1)
+    except Exception as e:
+        logger.warning(f"Session warm-up warning: {e}")
+
+    # 4. Iterate Chunks
+    for i, (chunk_start, chunk_end) in enumerate(date_chunks):
+
+        # We assume 1 page is enough for 30 days of holidays globally.
+        # If a single month ever has >256 holidays, we might need smaller chunks.
+        payload = {
+            "dateFrom": chunk_start,
+            "dateTo": chunk_end,
+            "country": "",
+            "currentTab": "custom",
+            "limit_from": "0",  # Always start at 0 for this specific date chunk
+            "showMore": "false",
+            "submitFilters": "1",
+            "byHandler": "true"
+        }
+
+        try:
+            logger.info(f"Fetching Chunk {i + 1}/{len(date_chunks)}: {chunk_start} to {chunk_end}...")
+            response = session.post(ajax_url, data=payload, headers=post_headers, timeout=DEFAULT_TIMEOUT)
+            response.raise_for_status()
+
+            data_json = response.json()
+            html_fragment = data_json.get('data', '')
+
+            if not html_fragment or "No results found" in html_fragment:
+                logger.info(f"Chunk {i + 1}: No holidays found.")
+                continue
+
+            soup = BeautifulSoup(html_fragment, 'html.parser')
+            rows = soup.find_all("tr")
+
+            current_sticky_date = ""
+            rows_found_in_chunk = 0
+
+            for row in rows:
+                tds = row.find_all("td")
+                if not tds:
+                    continue
+
+                # Detect Date (Sticky Header)
+                first_cell_text = tds[0].get_text(strip=True)
+                possible_date = parse_investing_date(first_cell_text)
+
+                if possible_date:
+                    current_sticky_date = possible_date
+                    data_cells = tds[1:]
+                else:
+                    data_cells = tds
+
+                if len(data_cells) < 3:
+                    continue
+
+                country = data_cells[0].get_text(strip=True)
+                market = data_cells[1].get_text(strip=True)
+                title = data_cells[2].get_text(strip=True)
+
+                status = "Closed"
+                if len(data_cells) > 3:
+                    status = data_cells[3].get_text(strip=True)
+
+                if not current_sticky_date:
+                    continue
+
+                pid = f"{current_sticky_date}-{country}-{market}-{title}".replace(" ", "-").lower()
+
+                all_holidays.append({
+                    "pid": pid,
+                    "date": current_sticky_date,
+                    "country": country,
+                    "market": market,
+                    "title": title,
+                    "time": status,
+                    "source": "Investing.com",
+                    "source_url": "https://uk.investing.com/holiday-calendar/"
+                })
+                rows_found_in_chunk += 1
+
+            logger.info(f"Chunk {i + 1}: Parsed {rows_found_in_chunk} holidays.")
+
+            # Gentle sleep between chunks
+            time.sleep(random.uniform(1.5, 3.0))
+
+        except Exception as e:
+            logger.error(f"Holiday scrape failed on chunk {chunk_start}: {e}")
+            # Continue to next chunk even if one fails
+            continue
+
+    logger.info(f"Holiday Scrape Complete. Total Holidays Found: {len(all_holidays)}")
+    return all_holidays
+
+
+if __name__ == "__main__":
+    # Test Run
+    results = scrape_holidays()
+    print(f"\nCaptured {len(results)} holidays.")
+
+#######################################
+# PATH: markets_data_scraper/modules/markets_data_scraper.log
+#######################################
+
+
+#######################################
+# PATH: markets_data_scraper/modules/models.py
+#######################################
+from sqlalchemy import String, Integer, DateTime, Text, func
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+from datetime import datetime
+
+
+class Base(DeclarativeBase):
+    """Base class for all SQLAlchemy models."""
+    pass
+
+
+class EventRecord(Base):
+    """
+    Stores economic events (e.g., CPI, NFP).
+    The 'pid' is the unique identifier from the source.
+    """
+    __tablename__ = "events"
+
+    # Primary Key provided by the source
+    pid: Mapped[str] = mapped_column(String, primary_key=True)
+
+    # Core Data
+    date: Mapped[str] = mapped_column(String, index=True)  # e.g., "2026-01-12"
+    title: Mapped[str] = mapped_column(String, index=True)
+    currency: Mapped[str] = mapped_column(String(10))
+    impact: Mapped[str] = mapped_column(String(10))  # "1", "2", "3"
+    time_str: Mapped[str] = mapped_column(String)  # "08:30" or "Tentative"
+
+    # Numeric/Value Fields - Stored as strings to preserve formatting (e.g. "5.2%")
+    actual: Mapped[str] = mapped_column(String, nullable=True)
+    forecast: Mapped[str] = mapped_column(String, nullable=True)
+    previous: Mapped[str] = mapped_column(String, nullable=True)
+
+    # Source Tracking
+    source: Mapped[str] = mapped_column(String, default="Investing.com")
+    source_url: Mapped[str] = mapped_column(String, default="https://uk.investing.com/economic-calendar")
+
+    # Metadata
+    last_updated: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), onupdate=func.now())
+
+
+class HolidayRecord(Base):
+    """Stores market holidays."""
+    __tablename__ = "holidays"
+
+    # Composite PID: date-country-market-title
+    pid: Mapped[str] = mapped_column(String, primary_key=True)
+
+    date_str: Mapped[str] = mapped_column(String, index=True)
+    country: Mapped[str] = mapped_column(String, index=True)
+    market: Mapped[str] = mapped_column(String)
+    title: Mapped[str] = mapped_column(String)
+    status: Mapped[str] = mapped_column(String)
+
+    # Source Tracking
+    source: Mapped[str] = mapped_column(String, default="Investing.com")
+    source_url: Mapped[str] = mapped_column(String, default="https://uk.investing.com/holiday-calendar/")
+
+    first_seen_utc: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    last_seen_utc: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), onupdate=func.now())
+
+
+class CountryReference(Base):
+    """Reference table for G7 priority and ISO mapping."""
+    __tablename__ = "country_reference"
+
+    country_name: Mapped[str] = mapped_column(String, primary_key=True)
+    iso_code: Mapped[str] = mapped_column(String(3))
+    country_priority: Mapped[int] = mapped_column(Integer, default=3)
+    currency: Mapped[str] = mapped_column(String(5))
+    currency_name: Mapped[str] = mapped_column(String)
+    currency_priority: Mapped[int] = mapped_column(Integer, default=3)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), onupdate=func.now())
+
+
+class AuditLog(Base):
+    """
+    Granular history of field changes.
+    Tracks 'Release' (new value) vs 'Revision' (correction).
+    """
+    __tablename__ = "audit_log"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    event_pid: Mapped[str] = mapped_column(String, index=True)
+
+    # Enum-like: INSERT, UPDATE, RELEASE, REVISION
+    change_type: Mapped[str] = mapped_column(String)
+    field_changed: Mapped[str] = mapped_column(String)
+
+    old_value: Mapped[str] = mapped_column(String, nullable=True)
+    new_value: Mapped[str] = mapped_column(String, nullable=True)
+
+    detected_at_utc: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    job_run_id: Mapped[str] = mapped_column(String, index=True)
+
+
+class JobLog(Base):
+    """
+    High-level summary of scraper execution.
+    """
+    __tablename__ = "job_logs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    run_id: Mapped[str] = mapped_column(String, unique=True)  # UUID
+    status: Mapped[str] = mapped_column(String)  # SUCCESS, FAILED
+
+    # Why did this job run? (BOOTSTRAP, SNIPER, PATROL, DYNAMIC_ADD)
+    trigger_reason: Mapped[str] = mapped_column(String, nullable=True)
+
+    # Health Metrics
+    events_added: Mapped[int] = mapped_column(Integer, default=0)
+    events_updated: Mapped[int] = mapped_column(Integer, default=0)
+    rows_omitted: Mapped[int] = mapped_column(Integer, default=0)  # Rows examined but unchanged
+
+    error_message: Mapped[str] = mapped_column(Text, nullable=True)
+    start_time_utc: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    end_time_utc: Mapped[datetime] = mapped_column(DateTime, nullable=True)
+
+#######################################
+# PATH: markets_data_scraper/modules/persistence_service.py
+#######################################
+import uuid
+import logging
+from datetime import datetime
+from sqlalchemy import select, func
+from sqlalchemy.dialects.sqlite import insert
+from sqlalchemy.exc import SQLAlchemyError
+from typing import List, Dict, Any, Tuple
+
+from database import SessionLocal
+from models import EventRecord, AuditLog, JobLog, HolidayRecord, CountryReference
+
+logger = logging.getLogger(__name__)
+
+
+class PersistenceService:
+    def __init__(self):
+        self.session = SessionLocal()
+
+    def upsert_events_with_audit(self, events_data: List[Dict[str, Any]], trigger_reason: str = "MANUAL") -> Tuple[
+        str, List[datetime]]:
+        run_id = str(uuid.uuid4())
+        added_count = 0
+        updated_count = 0
+        omitted_count = 0
+        new_times_found = []
+
+        if not events_data:
+            self._log_job_end(run_id, "SUCCESS", 0, 0, 0, trigger_reason=trigger_reason)
+            return run_id, []
+
+        try:
+            incoming_pids = [str(e['pid']) for e in events_data]
+            existing_records = self.session.query(EventRecord).filter(EventRecord.pid.in_(incoming_pids)).all()
+            existing_map = {rec.pid: rec for rec in existing_records}
+
+            for row in events_data:
+                pid = str(row['pid'])
+
+                clean_data = {
+                    "date": row.get("date", ""),
+                    "time_str": row.get("time_raw", ""),
+                    "currency": row.get("currency", ""),
+                    "title": row.get("title", ""),
+                    "impact": row.get("impact_raw", "1"),
+                    "actual": str(row.get("actual", "")).strip(),
+                    "forecast": str(row.get("forecast", "")).strip(),
+                    "previous": str(row.get("previous", "")).strip(),
+                    "source": row.get("source", "Investing.com"),
+                    "source_url": row.get("source_url", "https://uk.investing.com/economic-calendar")
+                }
+
+                if pid not in existing_map:
+                    record = EventRecord(pid=pid, **clean_data)
+                    self.session.add(record)
+                    self.session.add(AuditLog(
+                        event_pid=pid, change_type="INSERT", field_changed="ALL",
+                        old_value=None, new_value="Created", job_run_id=run_id
+                    ))
+                    added_count += 1
+                else:
+                    record = existing_map[pid]
+                    changes_found = False
+
+                    if record.source != clean_data['source']:
+                        record.source = clean_data['source']
+                    if record.source_url != clean_data['source_url']:
+                        record.source_url = clean_data['source_url']
+
+                    audit_fields = ['actual', 'forecast', 'previous', 'time_str', 'impact', 'title']
+
+                    for field in audit_fields:
+                        old_val = getattr(record, field) or ""
+                        new_val = clean_data[field]
+
+                        if old_val != new_val:
+                            if field == 'time_str':
+                                if (not old_val or ":" not in old_val) and (":" in new_val):
+                                    try:
+                                        today_str = clean_data['date']
+                                        full_dt_str = f"{today_str} {new_val}"
+                                        new_dt = datetime.strptime(full_dt_str, "%Y-%m-%d %H:%M")
+                                        new_times_found.append(new_dt)
+                                    except ValueError:
+                                        pass
+
+                            changes_found = True
+                            c_type = "UPDATE"
+                            if field == 'actual':
+                                if not old_val and new_val:
+                                    c_type = "RELEASE"
+                                elif old_val and new_val:
+                                    c_type = "REVISION"
+                            elif field in ['previous', 'forecast'] and old_val and new_val:
+                                c_type = "REVISION"
+
+                            self.session.add(AuditLog(
+                                event_pid=pid, change_type=c_type, field_changed=field,
+                                old_value=old_val, new_value=new_val, job_run_id=run_id
+                            ))
+                            setattr(record, field, new_val)
+
+                    if record.currency != clean_data['currency']:
+                        record.currency = clean_data['currency']
+                        changes_found = True
+
+                    if changes_found:
+                        record.last_updated = datetime.utcnow()
+                        updated_count += 1
+                    else:
+                        omitted_count += 1
+
+            self.session.commit()
+            self._log_job_end(run_id, "SUCCESS", added_count, updated_count, omitted_count,
+                              trigger_reason=trigger_reason)
+            logger.info(
+                f"Job {run_id} ({trigger_reason}) Complete: Added {added_count}, Updated {updated_count}, Omitted {omitted_count}")
+
+            return run_id, new_times_found
+
+        except Exception as e:
+            self.session.rollback()
+            self._log_job_end(run_id, "FAILED", added_count, updated_count, omitted_count, str(e),
+                              trigger_reason=trigger_reason)
+            logger.error(f"Job {run_id} Failed: {e}")
+            raise
+
+    def upsert_holidays(self, holidays_data: List[Dict[str, Any]]):
+        if not holidays_data: return
+        try:
+            clean_records = []
+            for item in holidays_data:
+                if not item.get("date"): continue
+
+                status_val = item.get("time", "")
+                if not status_val:
+                    status_val = "Closed"
+
+                clean_records.append({
+                    "pid": item["pid"],
+                    "date_str": item["date"],
+                    "country": item["country"],
+                    "market": item["market"],
+                    "title": item["title"],
+                    "status": status_val,
+                    "source": item.get("source", "Investing.com"),
+                    "source_url": item.get("source_url", "https://uk.investing.com/holiday-calendar/")
+                })
+
+            stmt = insert(HolidayRecord).values(clean_records)
+            stmt = stmt.on_conflict_do_update(
+                index_elements=['pid'],
+                set_={
+                    "status": stmt.excluded.status,
+                    "last_seen_utc": func.now(),
+                    "source": stmt.excluded.source,
+                    "source_url": stmt.excluded.source_url
+                }
+            )
+            self.session.execute(stmt)
+            self.session.commit()
+            logger.info(f"Upserted {len(clean_records)} holidays.")
+        except SQLAlchemyError as e:
+            self.session.rollback()
+            logger.error(f"DB Error (Holidays): {e}")
+
+    def seed_country_reference(self):
+        data = [
+            ("Argentina", "AR", 45, "ARS", 45, "Argentine Peso"),
+            ("Australia", "AU", 8, "AUD", 8, "Australian Dollar"),
+            ("Austria", "AT", 36, "EUR", 4, "Euro"),
+            ("Bahrain", "BH", 48, "BHD", 48, "Bahraini Dinar"),
+            ("Bangladesh", "BD", 74, "BDT", 74, "Bangladeshi Taka"),
+            ("Belgium", "BE", 22, "EUR", 4, "Euro"),
+            ("Bermuda", "BM", 88, "BMD", 88, "Bermudian Dollar"),
+            ("Bosnia-Herzegovina", "BA", 94, "BAM", 94, "Bosnia and Herzegovina Convertible Mark"),
+            ("Botswana", "BW", 80, "BWP", 80, "Botswana Pula"),
+            ("Brazil", "BR", 15, "BRL", 15, "Brazilian Real"),
+            ("Bulgaria", "BG", 65, "BGN", 65, "Bulgarian Lev"),
+            ("Canada", "CA", 7, "CAD", 7, "Canadian Dollar"),
+            ("Cayman Islands", "KY", 89, "KYD", 89, "Cayman Islands Dollar"),
+            ("Chile", "CL", 42, "CLP", 42, "Chilean Peso"),
+            ("China", "CN", 5, "CNY", 5, "Chinese Yuan"),
+            ("Colombia", "CO", 43, "COP", 43, "Colombian Peso"),
+            ("Costa Rica", "CR", 83, "CRC", 83, "Costa Rican Colón"),
+            ("Cote D'Ivoire", "CI", 86, "XOF", 86, "West African CFA Franc"),
+            ("Croatia", "HR", 62, "EUR", 4, "Euro"),
+            ("Cyprus", "CY", 55, "EUR", 4, "Euro"),
+            ("Czech Republic", "CZ", 39, "CZK", 39, "Czech Koruna"),
+            ("Denmark", "DK", 37, "DKK", 37, "Danish Krone"),
+            ("Ecuador", "EC", 84, "USD", 1, "United States Dollar"),
+            ("Egypt", "EG", 46, "EGP", 46, "Egyptian Pound"),
+            ("Estonia", "EE", 59, "EUR", 4, "Euro"),
+            ("Euro Zone", "EU", 2, "EUR", 4, "Euro"),
+            ("Finland", "FI", 38, "EUR", 4, "Euro"),
+            ("France", "FR", 6, "EUR", 4, "Euro"),
+            ("Germany", "DE", 4, "EUR", 4, "Euro"),
+            ("Greece", "GR", 56, "EUR", 4, "Euro"),
+            ("Hong Kong", "HK", 11, "HKD", 11, "Hong Kong Dollar"),
+            ("Hungary", "HU", 40, "HUF", 40, "Hungarian Forint"),
+            ("Iceland", "IS", 87, "ISK", 87, "Icelandic Króna"),
+            ("India", "IN", 14, "INR", 14, "Indian Rupee"),
+            ("Indonesia", "ID", 26, "IDR", 26, "Indonesian Rupiah"),
+            ("Iraq", "IQ", 90, "IQD", 90, "Iraqi Dinar"),
+            ("Ireland", "IE", 35, "EUR", 4, "Euro"),
+            ("Israel", "IL", 34, "ILS", 34, "Israeli New Shekel"),
+            ("Italy", "IT", 12, "EUR", 4, "Euro"),
+            ("Jamaica", "JM", 82, "JMD", 82, "Jamaican Dollar"),
+            ("Japan", "JP", 3, "JPY", 3, "Japanese Yen"),
+            ("Jordan", "JO", 68, "JOD", 68, "Jordanian Dinar"),
+            ("Kazakhstan", "KZ", 51, "KZT", 51, "Kazakhstani Tenge"),
+            ("Kenya", "KE", 71, "KES", 71, "Kenyan Shilling"),
+            ("Kuwait", "KW", 47, "KWD", 47, "Kuwaiti Dinar"),
+            ("Latvia", "LV", 60, "EUR", 4, "Euro"),
+            ("Lebanon", "LB", 69, "LBP", 69, "Lebanese Pound"),
+            ("Lithuania", "LT", 61, "EUR", 4, "Euro"),
+            ("Luxembourg", "LU", 54, "EUR", 4, "Euro"),
+            ("Malawi", "MW", 79, "MWK", 79, "Malawian Kwacha"),
+            ("Malaysia", "MY", 32, "MYR", 32, "Malaysian Ringgit"),
+            ("Malta", "MT", 96, "EUR", 4, "Euro"),
+            ("Mauritius", "MU", 97, "MUR", 97, "Mauritian Rupee"),
+            ("Mexico", "MX", 18, "MXN", 18, "Mexican Peso"),
+            ("Mongolia", "MN", 70, "MNT", 70, "Mongolian Tögrög"),
+            ("Montenegro", "ME", 95, "EUR", 4, "Euro"),
+            ("Morocco", "MA", 58, "MAD", 58, "Moroccan Dirham"),
+            ("Namibia", "NA", 81, "NAD", 81, "Namibian Dollar"),
+            ("Netherlands", "NL", 16, "EUR", 4, "Euro"),
+            ("New Zealand", "NZ", 53, "NZD", 53, "New Zealand Dollar"),
+            ("Nigeria", "NG", 72, "NGN", 72, "Nigerian Naira"),
+            ("Norway", "NO", 23, "NOK", 23, "Norwegian Krone"),
+            ("Oman", "OM", 67, "OMR", 67, "Omani Rial"),
+            ("Pakistan", "PK", 49, "PKR", 49, "Pakistani Rupee"),
+            ("Palestinian Territory", "PS", 85, "ILS", 34, "Israeli New Shekel"),
+            ("Peru", "PE", 44, "PEN", 44, "Peruvian Sol"),
+            ("Philippines", "PH", 30, "PHP", 30, "Philippine Peso"),
+            ("Poland", "PL", 27, "PLN", 27, "Polish Złoty"),
+            ("Portugal", "PT", 57, "EUR", 4, "Euro"),
+            ("Qatar", "QA", 25, "QAR", 25, "Qatari Riyal"),
+            ("Romania", "RO", 41, "RON", 41, "Romanian Leu"),
+            ("Russia", "RU", 24, "RUB", 24, "Russian Ruble"),
+            ("Rwanda", "RW", 91, "RWF", 91, "Rwandan Franc"),
+            ("Saudi Arabia", "SA", 19, "SAR", 19, "Saudi Riyal"),
+            ("Serbia", "RS", 66, "RSD", 66, "Serbian Dinar"),
+            ("Singapore", "SG", 10, "SGD", 10, "Singapore Dollar"),
+            ("Slovakia", "SK", 64, "EUR", 4, "Euro"),
+            ("Slovenia", "SI", 63, "EUR", 4, "Euro"),
+            ("South Africa", "ZA", 33, "ZAR", 33, "South African Rand"),
+            ("South Korea", "KR", 13, "KRW", 13, "South Korean Won"),
+            ("Spain", "ES", 17, "EUR", 4, "Euro"),
+            ("Sri Lanka", "LK", 73, "LKR", 73, "Sri Lankan Rupee"),
+            ("Sweden", "SE", 21, "SEK", 21, "Swedish Krona"),
+            ("Switzerland", "CH", 9, "CHF", 9, "Swiss Franc"),
+            ("Taiwan", "TW", 29, "TWD", 29, "New Taiwan Dollar"),
+            ("Tanzania", "TZ", 76, "TZS", 76, "Tanzanian Shilling"),
+            ("Thailand", "TH", 31, "THB", 31, "Thai Baht"),
+            ("Tunisia", "TN", 92, "TND", 92, "Tunisian Dinar"),
+            ("Türkiye", "TR", 28, "TRY", 28, "Turkish Lira"),
+            ("Uganda", "UG", 75, "UGX", 75, "Ugandan Shilling"),
+            ("Ukraine", "UA", 52, "UAH", 52, "Ukrainian Hryvnia"),
+            ("United Arab Emirates", "AE", 20, "AED", 20, "United Arab Emirates Dirham"),
+            ("United Kingdom", "GB", 2, "GBP", 2, "Pound Sterling"),
+            ("United States", "US", 1, "USD", 1, "United States Dollar"),
+            ("Venezuela", "VE", 93, "VES", 93, "Venezuelan Bolívar"),
+            ("Vietnam", "VN", 50, "VND", 50, "Vietnamese Dong"),
+            ("Zambia", "ZM", 77, "ZMW", 77, "Zambian Kwacha"),
+            ("Zimbabwe", "ZW", 78, "ZWL", 78, "Zimbabwean Dollar"),
+
+            # --- ALIASES FOR ROBUSTNESS ---
+            ("USA", "US", 1, "USD", 1, "United States Dollar"),
+            ("UK", "GB", 2, "GBP", 2, "Pound Sterling"),
+            ("Great Britain", "GB", 2, "GBP", 2, "Pound Sterling"),
+            ("Russia", "RU", 24, "RUB", 24, "Russian Ruble"),
+            ("Russian Federation", "RU", 24, "RUB", 24, "Russian Ruble")
+        ]
+
+        try:
+            for row in data:
+                record = CountryReference(
+                    country_name=row[0], iso_code=row[1], country_priority=row[2],
+                    currency=row[3], currency_priority=row[4], currency_name=row[5]
+                )
+                self.session.merge(record)
+            self.session.commit()
+            logger.info(f"Seeded/Updated {len(data)} Country Reference Records.")
+        except Exception as e:
+            self.session.rollback()
+            logger.error(f"Seeding Error: {e}")
+
+    def _log_job_end(self, run_id, status, added, updated, omitted, error=None, trigger_reason=None):
+        try:
+            log = JobLog(
+                run_id=run_id,
+                status=status,
+                trigger_reason=trigger_reason,
+                events_added=added,
+                events_updated=updated,
+                rows_omitted=omitted,
+                error_message=error,
+                end_time_utc=datetime.utcnow()
+            )
+            self.session.add(log)
+            self.session.commit()
+        except Exception as e:
+            logger.critical(f"Failed to write job log: {e}")
+
+    def close(self):
+        self.session.close()
+
+#######################################
+# PATH: markets_data_scraper/modules/run_scheduler.py
+#######################################
+#######################################
+# PATH: markets_data_scraper/modules/run_scheduler.py
+#######################################
+import sys
+import os
+import time
+import logging
+from datetime import datetime, date, timedelta
+from typing import List, Dict
+
+from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
+from apscheduler.executors.pool import ThreadPoolExecutor
+
+# --- 1. Robust Path Setup ---
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+PARENT_DIR = os.path.dirname(CURRENT_DIR)
+
+sys.path.append(PARENT_DIR)
+sys.path.append(CURRENT_DIR)
+
+# --- 2. Imports ---
+try:
+    from database import init_db, DB_URL
+    from persistence_service import PersistenceService
+    from events_scraper import scrape_events
+    from holiday_scraper import scrape_holidays
+    from default_logger import get_logger
+    from models import EventRecord
+except ImportError as e:
+    print(f"CRITICAL: Failed to import backend modules. Path issue? Error: {e}")
+    sys.exit(1)
+
+logger = get_logger("AdaptiveScheduler")
+
+# --- SCHEDULER CONFIG ---
+jobstores = {
+    'default': SQLAlchemyJobStore(url=DB_URL)
+}
+executors = {
+    'default': ThreadPoolExecutor(20)
+}
+job_defaults = {
+    'coalesce': True,
+    'max_instances': 1
+}
+
+scheduler = BackgroundScheduler(jobstores=jobstores, executors=executors, job_defaults=job_defaults)
+
+
+def log_full_schedule_report():
+    """
+    Generates a single, merged chronological timeline of ALL system activity.
+    Combines:
+      1. Routine Jobs (Patrols, Bootstraps from APScheduler)
+      2. Dynamic Targets (Upcoming Data Releases from DB)
+    """
+    service = PersistenceService()
+    try:
+        timeline = []
+        now = datetime.now()
+        lookahead_window = now + timedelta(hours=24)
+
+        # --- 1. FETCH ROUTINE JOBS (Scheduler) ---
+        routine_jobs = scheduler.get_jobs()
+        for job in routine_jobs:
+            if not job.next_run_time:
+                continue
+            if 'dynamic' in job.id:
+                continue
+
+            timeline.append({
+                'time': job.next_run_time.replace(tzinfo=None),
+                'type': 'ROUTINE',
+                'label': f"System Task: {job.id} ({job.trigger})"
+            })
+
+        # --- 2. FETCH DYNAMIC TARGETS (Database) ---
+        today_str = now.strftime("%Y-%m-%d")
+        tomorrow_str = lookahead_window.strftime("%Y-%m-%d")
+
+        records = service.session.query(EventRecord).filter(
+            EventRecord.date.in_([today_str, tomorrow_str]),
+            EventRecord.time_str.like("%:%")
+        ).all()
+
+        grouped_dynamic_targets: Dict[datetime, List[str]] = {}
+
+        for r in records:
+            try:
+                event_dt = datetime.strptime(f"{r.date} {r.time_str}", "%Y-%m-%d %H:%M")
+                trigger_dt = event_dt + timedelta(seconds=30)
+
+                if now < trigger_dt <= lookahead_window:
+                    if trigger_dt not in grouped_dynamic_targets:
+                        grouped_dynamic_targets[trigger_dt] = []
+                    grouped_dynamic_targets[trigger_dt].append(f"{r.title} ({r.currency})")
+            except:
+                continue
+
+        for trigger_dt, events in grouped_dynamic_targets.items():
+            if len(events) > 3:
+                desc = f"{events[0]}, {events[1]} + {len(events) - 2} others"
+            else:
+                desc = ", ".join(events)
+
+            timeline.append({
+                'time': trigger_dt,
+                'type': 'DYNAMIC',
+                'label': f"Targeting {len(events)} Events: {desc}"
+            })
+
+        # --- 3. SORT & DISPLAY ---
+        timeline.sort(key=lambda x: x['time'])
+
+        logger.info("\n=== 24-HOUR OPERATIONS TIMELINE ===")
+        if not timeline:
+            logger.info("  No jobs scheduled for the next 24 hours.")
+
+        for item in timeline:
+            ts = item['time']
+            day_label = "Today" if ts.date() == now.date() else "Tomorrow"
+            time_str = ts.strftime("%H:%M:%S")
+            type_tag = f"[{item['type']}]"
+
+            logger.info(f"  {day_label} {time_str} | {type_tag:<8} {item['label']}")
+
+        logger.info("===================================\n")
+
+    except Exception as e:
+        logger.error(f"Failed to generate schedule report: {e}")
+    finally:
+        service.close()
+
+
+def execute_scrape_job(trigger_reason: str):
+    logger.info(f"--- EXECUTION START | Reason: {trigger_reason} ---")
+    service = PersistenceService()
+
+    try:
+        today = date.today()
+        start_date = today - timedelta(days=3)
+        end_date = today + timedelta(days=21)
+
+        events = scrape_events(date_from=str(start_date), date_to=str(end_date), pages=5)
+
+        if events:
+            run_id, new_times = service.upsert_events_with_audit(events, trigger_reason=trigger_reason)
+
+            if new_times:
+                logger.info(f"FEEDBACK LOOP: Detected {len(new_times)} new confirmed times. Adjusting schedule...")
+                schedule_dynamic_jobs(new_times)
+            else:
+                logger.info(f"Events Sync Complete (Run {run_id}).")
+
+            if trigger_reason in ['PATROL', 'MANUAL']:
+                log_full_schedule_report()
+
+        else:
+            logger.warning("Scraper returned 0 events.")
+
+    except Exception as e:
+        logger.error(f"Execution Failed: {e}", exc_info=True)
+    finally:
+        service.close()
+        logger.info("--- EXECUTION END ---")
+
+
+def schedule_dynamic_jobs(dt_list: List[datetime]):
+    if not dt_list: return
+
+    targets = [dt + timedelta(seconds=30) for dt in dt_list]
+    targets.sort()
+
+    clustered_times = []
+    if targets:
+        current_cluster_time = targets[0]
+        for i in range(1, len(targets)):
+            if (targets[i] - current_cluster_time).total_seconds() > 120:
+                clustered_times.append(current_cluster_time)
+                current_cluster_time = targets[i]
+            else:
+                current_cluster_time = max(current_cluster_time, targets[i])
+        clustered_times.append(current_cluster_time)
+
+    count = 0
+    now = datetime.now()
+
+    for run_time in clustered_times:
+        if run_time > now:
+            job_id = f"dynamic_{run_time.strftime('%Y%m%d_%H%M%S')}"
+            try:
+                scheduler.add_job(
+                    execute_scrape_job,
+                    'date',
+                    run_date=run_time,
+                    args=['DYNAMIC'],
+                    id=job_id,
+                    replace_existing=True
+                )
+                count += 1
+            except Exception as e:
+                logger.warning(f"Could not schedule dynamic job {job_id}: {e}")
+
+    if count > 0:
+        logger.info(f"DYNAMIC STRATEGY: Consolidated and scheduled {count} distinct target windows.")
+
+
+def run_bootstrap():
+    logger.info("--- BOOTSTRAP INITIATED ---")
+    service = PersistenceService()
+    try:
+        service.seed_country_reference()
+
+        logger.info("BOOTSTRAP: Checking for holidays (Rolling 1-Year Window)...")
+        # UPDATED: Removed 'year' argument
+        holidays = scrape_holidays()
+        if holidays:
+            service.upsert_holidays(holidays)
+
+        logger.info("BOOTSTRAP: Running immediate scrape to populate DB...")
+        execute_scrape_job("BOOTSTRAP")
+
+        logger.info("BOOTSTRAP: Scanning DB for event times (Window: Today + Tomorrow)...")
+        today = date.today()
+        tomorrow = today + timedelta(days=1)
+        target_dates = [today.strftime("%Y-%m-%d"), tomorrow.strftime("%Y-%m-%d")]
+
+        records = service.session.query(EventRecord).filter(
+            EventRecord.date.in_(target_dates),
+            EventRecord.time_str.like("%:%")
+        ).all()
+
+        dt_list = []
+        for r in records:
+            try:
+                full_dt = datetime.strptime(f"{r.date} {r.time_str}", "%Y-%m-%d %H:%M")
+                if full_dt > datetime.now() - timedelta(minutes=10):
+                    dt_list.append(full_dt)
+            except:
+                continue
+
+        logger.info(f"BOOTSTRAP: Found {len(dt_list)} raw events. Calculating consolidated Dynamic schedule...")
+        schedule_dynamic_jobs(dt_list)
+
+        log_full_schedule_report()
+
+    except Exception as e:
+        logger.error(f"BOOTSTRAP FAILED: {e}", exc_info=True)
+    finally:
+        service.close()
+        logger.info("--- BOOTSTRAP COMPLETE ---")
+
+
+if __name__ == "__main__":
+    init_db()
+    scheduler.start()
+    logger.info("SCHEDULER STARTED. Press Ctrl+C to exit.")
+
+    scheduler.add_job(
+        execute_scrape_job,
+        'interval',
+        minutes=15,
+        jitter=180,
+        args=['PATROL'],
+        id='patrol_routine',
+        replace_existing=True
+    )
+
+    scheduler.add_job(
+        run_bootstrap,
+        'cron',
+        hour=0,
+        minute=5,
+        id='daily_bootstrap',
+        replace_existing=True
+    )
+
+    run_bootstrap()
+
+    try:
+        while True:
+            time.sleep(1)
+    except (KeyboardInterrupt, SystemExit):
+        logger.info("Shutting down scheduler...")
+        scheduler.shutdown()
+
+#######################################
+# PATH: markets_data_scraper/modules/run_scraper.py
+#######################################
+#######################################
+# PATH: markets_data_scraper/modules/run_scraper.py
+#######################################
+import sys
+import os
+import logging
+from datetime import date, timedelta
+
+# --- 1. Path Setup ---
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+SCRAPER_PKG_DIR = os.path.join(BASE_DIR, "..")
+MODULES_DIR = os.path.join(SCRAPER_PKG_DIR, "modules")
+
+sys.path.append(SCRAPER_PKG_DIR)
+sys.path.append(MODULES_DIR)
+
+# --- 2. Imports ---
+try:
+    from database import init_db
+    from persistence_service import PersistenceService
+    from events_scraper import scrape_events
+    from holiday_scraper import scrape_holidays
+    from default_logger import get_logger
+    from models import CountryReference
+except ImportError as e:
+    print(f"CRITICAL: Failed to import backend modules. Is the directory structure correct? Error: {e}")
+    sys.exit(1)
+
+logger = get_logger("ScraperScheduler")
+
+
+def run_job():
+    logger.info("--- STARTING SCHEDULED SCRAPE JOB ---")
+
+    # 3. Initialization
+    init_db()
+    service = PersistenceService()
+
+    # Ensure reference data is seeded on first run
+    service.seed_country_reference()
+
+    try:
+        # 4. Define Time Window
+        today = date.today()
+        start_date = today - timedelta(days=3)
+        end_date = today + timedelta(days=21)
+
+        logger.info(f"Targeting Event Window: {start_date} to {end_date}")
+
+        # 5. Scrape Events
+        events = scrape_events(date_from=str(start_date), date_to=str(end_date), pages=5)
+
+        if events:
+            run_id = service.upsert_events_with_audit(events)
+            logger.info(f"Events Sync Success. Audit Run ID: {run_id}")
+        else:
+            logger.warning("Scraper returned 0 events. Network issue or empty calendar?")
+
+        # 6. Scrape Holidays (Rolling 1-Year Window)
+        logger.info("Targeting Holidays (Rolling Window: -10d to +365d)...")
+        # UPDATED: Removed 'year' argument
+        holidays = scrape_holidays()
+        if holidays:
+            service.upsert_holidays(holidays)
+        else:
+            logger.warning("No holidays found (might be expected depending on filtering).")
+
+    except Exception as e:
+        logger.critical(f"JOB FAILED: {e}", exc_info=True)
+        sys.exit(1)
+    finally:
+        service.close()
+        logger.info("--- JOB FINISHED ---")
+
+
+if __name__ == "__main__":
+    run_job()
+
+#######################################
+# PATH: markets_data_scraper/modules/scrapers.py
+#######################################
+import requests
+from bs4 import BeautifulSoup
+import time
+from typing import List, Dict, Any
+
+
+def scrape_events(date_from: str, date_to: str, pages: int = 3) -> List[Dict[str, Any]]:
+    """
+    Scrapes economic events (CPI, NFP, etc.) for a given date range.
+    automatically cleans 'bull3' -> '3' for impact scoring.
+    """
+    url = "https://www.investing.com/economic-calendar/Service/getCalendarFilteredData"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+        "X-Requested-With": "XMLHttpRequest",
+        "Referer": "https://www.investing.com/economic-calendar/",
+    }
+
+    all_events = []
+    seen_pids = set()
+
+    print(f"--- Starting Events Scrape ({date_from} to {date_to}) ---")
+
+    for page in range(pages):
+        payload = {
+            "dateFrom": date_from,
+            "dateTo": date_to,
+            "timeZone": "8",  # Europe/London
+            "currentTab": "custom",
+            "limit_from": str(page),
+            "submitFilters": "1"
+        }
+
+        try:
+            print(f"Fetching Events Page {page}...")
+            response = requests.post(url, data=payload, headers=headers, timeout=30)
+            data_json = response.json()
+            html_fragment = data_json.get('data', '')
+
+            if not html_fragment:
+                break
+
+            soup = BeautifulSoup(html_fragment, 'html.parser')
+            rows = soup.find_all("tr", class_="js-event-item")
+
+            for row in rows:
+                pid = row.get("id", "").replace("eventRowId_", "")
+                if pid and pid not in seen_pids:
+                    seen_pids.add(pid)
+
+                    # --- IMPACT CLEANING LOGIC ---
+                    # Extract raw value (e.g., "bull3", "grayFull")
+                    raw_impact = "1"  # Default to low
+                    sentiment_td = row.find("td", class_="sentiment")
+                    if sentiment_td:
+                        raw_str = sentiment_td.get("data-img_key", "")
+                        # Remove "bull" to get "1", "2", "3"
+                        # "grayFull" is usually a holiday or non-event, mapped to 0 or 1
+                        clean_impact = raw_str.replace("bull", "").replace("grayFull", "0")
+
+                        if clean_impact.isdigit():
+                            raw_impact = clean_impact
+
+                    all_events.append({
+                        "pid": pid,
+                        "title": row.find("td", class_="event").get_text(strip=True) if row.find("td",
+                                                                                                 class_="event") else "N/A",
+                        "impact_raw": raw_impact,  # Now stores "1", "2", "3"
+                        "currency": row.find("td", class_="flagCur").get_text(strip=True) if row.find("td",
+                                                                                                      class_="flagCur") else "",
+                        "actual": row.find("td", class_="bold").get_text(strip=True) if row.find("td",
+                                                                                                 class_="bold") else "",
+                        "forecast": row.find("td", class_="fore").get_text(strip=True) if row.find("td",
+                                                                                                   class_="fore") else "",
+                        "previous": row.find("td", class_="prev").get_text(strip=True) if row.find("td",
+                                                                                                   class_="prev") else "",
+                        "time_raw": row.find("td", class_="js-time").get_text(strip=True) if row.find("td",
+                                                                                                      class_="js-time") else ""
+                    })
+            time.sleep(1)
+
+        except Exception as e:
+            print(f"Event scrape failed on page {page}: {e}")
+            break
+
+    return all_events
+
+
+if __name__ == "__main__":
+    # Test run when executed directly
+    import json
+
+    data = scrape_events("2026-01-01", "2026-01-03", pages=1)
+    print(json.dumps(data[:3], indent=2))
+
+#######################################
+# PATH: Temp/discovery_output.json
+#######################################
+[
+    {
+        "pid": "538016",
+        "title": "S&P Global Services PMI  (Dec)",
+        "impact_raw": "bull1",
+        "currency": "INR",
+        "actual": "58.0",
+        "forecast": "59.1",
+        "previous": "59.8",
+        "time_raw": "00:00"
+    },
+    {
+        "pid": "538015",
+        "title": "Manufacturing & Services PMI  (Dec)",
+        "impact_raw": "bull1",
+        "currency": "INR",
+        "actual": "57.80",
+        "forecast": "58.90",
+        "previous": "59.70",
+        "time_raw": "00:00"
+    },
+    {
+        "pid": "539008",
+        "title": "Estonian Industrial Production (MoM)  (Nov)",
+        "impact_raw": "bull1",
+        "currency": "EUR",
+        "actual": "6.00%",
+        "forecast": "",
+        "previous": "2.40%",
+        "time_raw": "01:00"
+    },
+    {
+        "pid": "539009",
+        "title": "Estonian Industrial Production (YoY)  (Nov)",
+        "impact_raw": "bull1",
+        "currency": "EUR",
+        "actual": "3.40%",
+        "forecast": "",
+        "previous": "-1.20%",
+        "time_raw": "01:00"
+    },
+    {
+        "pid": "538066",
+        "title": "M3 Money Supply  (Nov)",
+        "impact_raw": "bull1",
+        "currency": "DKK",
+        "actual": "2,071.0B",
+        "forecast": "",
+        "previous": "2,020.0B",
+        "time_raw": "02:00"
+    },
+    {
+        "pid": "538027",
+        "title": "S&P Global Manufacturing PMI  (Dec)",
+        "impact_raw": "bull1",
+        "currency": "ZAR",
+        "actual": "47.7",
+        "forecast": "",
+        "previous": "49.0",
+        "time_raw": "02:15"
+    },
+    {
+        "pid": "539010",
+        "title": "Trade Balance (EUR) (MoM)  (Nov)",
+        "impact_raw": "bull1",
+        "currency": "HUF",
+        "actual": "-121.0M",
+        "forecast": "713.0M",
+        "previous": "644.0M",
+        "time_raw": "02:30"
+    },
+    {
+        "pid": "538070",
+        "title": "French CPI (MoM)  (Dec)",
+        "impact_raw": "bull2",
+        "currency": "EUR",
+        "actual": "0.1%",
+        "forecast": "0.2%",
+        "previous": "-0.2%",
+        "time_raw": "02:45"
+    },
+    {
+        "pid": "538071",
+        "title": "French CPI (YoY)  (Dec)",
+        "impact_raw": "bull1",
+        "currency": "EUR",
+        "actual": "0.8%",
+        "forecast": "0.9%",
+        "previous": "0.9%",
+        "time_raw": "02:45"
+    },
+    {
+        "pid": "539011",
+        "title": "French HICP (MoM)  (Dec)",
+        "impact_raw": "bull2",
+        "currency": "EUR",
+        "actual": "0.1%",
+        "forecast": "0.2%",
+        "previous": "-0.2%",
+        "time_raw": "02:45"
+    },
+    {
+        "pid": "539012",
+        "title": "French HICP (YoY)  (Dec)",
+        "impact_raw": "bull1",
+        "currency": "EUR",
+        "actual": "0.7%",
+        "forecast": "0.8%",
+        "previous": "0.8%",
+        "time_raw": "02:45"
+    },
+    {
+        "pid": "538072",
+        "title": "Trade Balance NRA  (Nov)",
+        "impact_raw": "bull1",
+        "currency": "CZK",
+        "actual": "16.2B",
+        "forecast": "28.0B",
+        "previous": "24.2B",
+        "time_raw": "03:00"
+    },
+    {
+        "pid": "539024",
+        "title": "Exports  (Dec)",
+        "impact_raw": "bull1",
+        "currency": "TRY",
+        "actual": "26.40B",
+        "forecast": "",
+        "previous": "22.50B",
+        "time_raw": "03:00"
+    },
+    {
+        "pid": "539166",
+        "title": "Trade Balance  (Dec)",
+        "impact_raw": "bull1",
+        "currency": "TRY",
+        "actual": "-9.40B",
+        "forecast": "",
+        "previous": "-7.98B",
+        "time_raw": "03:00"
+    },
+    {
+        "pid": "538073",
+        "title": "HCOB Spain Services PMI  (Dec)",
+        "impact_raw": "bull2",
+        "currency": "EUR",
+        "actual": "57.1",
+        "forecast": "54.8",
+        "previous": "55.6",
+        "time_raw": "03:15"
+    },
+    {
+        "pid": "538074",
+        "title": "FX Reserves USD  (Dec)",
+        "impact_raw": "bull1",
+        "currency": "TWD",
+        "actual": "602.55B",
+        "forecast": "",
+        "previous": "599.79B",
+        "time_raw": "03:20"
+    },
+    {
+        "pid": "538075",
+        "title": "HCOB Italy Composite PMI  (Dec)",
+        "impact_raw": "bull1",
+        "currency": "EUR",
+        "actual": "50.3",
+        "forecast": "",
+        "previous": "53.8",
+        "time_raw": "03:45"
+    },
+    {
+        "pid": "538076",
+        "title": "HCOB Italy Services PMI  (Dec)",
+        "impact_raw": "bull2",
+        "currency": "EUR",
+        "actual": "51.5",
+        "forecast": "54.2",
+        "previous": "55.0",
+        "time_raw": "03:45"
+    },
+    {
+        "pid": "538078",
+        "title": "HCOB France Composite PMI  (Dec)",
+        "impact_raw": "bull1",
+        "currency": "EUR",
+        "actual": "50.0",
+        "forecast": "50.1",
+        "previous": "50.4",
+        "time_raw": "03:50"
+    },
+    {
+        "pid": "538077",
+        "title": "HCOB France Services PMI  (Dec)",
+        "impact_raw": "bull2",
+        "currency": "EUR",
+        "actual": "50.1",
+        "forecast": "50.2",
+        "previous": "51.4",
+        "time_raw": "03:50"
+    },
+    {
+        "pid": "538079",
+        "title": "HCOB Germany Composite PMI  (Dec)",
+        "impact_raw": "bull1",
+        "currency": "EUR",
+        "actual": "51.3",
+        "forecast": "51.5",
+        "previous": "52.4",
+        "time_raw": "03:55"
+    },
+    {
+        "pid": "538080",
+        "title": "HCOB Germany Services PMI  (Dec)",
+        "impact_raw": "bull2",
+        "currency": "EUR",
+        "actual": "52.7",
+        "forecast": "52.6",
+        "previous": "53.1",
+        "time_raw": "03:55"
+    },
+    {
+        "pid": "539014",
+        "title": "Car Registration (YoY)  (Dec)",
+        "impact_raw": "bull1",
+        "currency": "GBP",
+        "actual": "3.9%",
+        "forecast": "",
+        "previous": "-1.6%",
+        "time_raw": "04:00"
+    },
+    {
+        "pid": "538092",
+        "title": "United Kingdom New Passenger Cars Registration  (Dec)",
+        "impact_raw": "bull1",
+        "currency": "GBP",
+        "actual": "146,249.0",
+        "forecast": "",
+        "previous": "151,154.0",
+        "time_raw": "04:00"
+    },
+    {
+        "pid": "539435",
+        "title": "Brandenburg CPI (YoY)  (Dec)",
+        "impact_raw": "bull1",
+        "currency": "EUR",
+        "actual": "2.2%",
+        "forecast": "",
+        "previous": "2.6%",
+        "time_raw": "04:00"
+    },
+    {
+        "pid": "539436",
+        "title": "Brandenburg CPI (MoM)  (Dec)",
+        "impact_raw": "bull1",
+        "currency": "EUR",
+        "actual": "0.4%",
+        "forecast": "",
+        "previous": "-0.2%",
+        "time_raw": "04:00"
+    },
+    {
+        "pid": "538938",
+        "title": "Hesse CPI (MoM)  (Dec)",
+        "impact_raw": "bull1",
+        "currency": "EUR",
+        "actual": "0.1%",
+        "forecast": "",
+        "previous": "-0.2%",
+        "time_raw": "04:00"
+    },
+    {
+        "pid": "538939",
+        "title": "Hesse CPI (YoY)  (Dec)",
+        "impact_raw": "bull1",
+        "currency": "EUR",
+        "actual": "2.2%",
+        "forecast": "",
+        "previous": "2.5%",
+        "time_raw": "04:00"
+    },
+    {
+        "pid": "539246",
+        "title": "North Rhine Westphalia CPI (MoM)  (Dec)",
+        "impact_raw": "bull1",
+        "currency": "EUR",
+        "actual": "0.0%",
+        "forecast": "",
+        "previous": "-0.3%",
+        "time_raw": "04:00"
+    },
+    {
+        "pid": "539247",
+        "title": "North Rhine Westphalia CPI (YoY)  (Dec)",
+        "impact_raw": "bull1",
+        "currency": "EUR",
+        "actual": "1.8%",
+        "forecast": "",
+        "previous": "2.3%",
+        "time_raw": "04:00"
+    },
+    {
+        "pid": "538940",
+        "title": "Saxony CPI (YoY)  (Dec)",
+        "impact_raw": "bull1",
+        "currency": "EUR",
+        "actual": "1.9%",
+        "forecast": "",
+        "previous": "2.2%",
+        "time_raw": "04:00"
+    },
+    {
+        "pid": "538941",
+        "title": "Saxony CPI (MoM)  (Dec)",
+        "impact_raw": "bull1",
+        "currency": "EUR",
+        "actual": "0.2%",
+        "forecast": "",
+        "previous": "-0.2%",
+        "time_raw": "04:00"
+    },
+    {
+        "pid": "539013",
+        "title": "IPC-Fipe Inflation Index (MoM)  (Dec)",
+        "impact_raw": "bull2",
+        "currency": "BRL",
+        "actual": "0.32%",
+        "forecast": "",
+        "previous": "0.20%",
+        "time_raw": "04:00"
+    },
+    {
+        "pid": "538094",
+        "title": "HCOB Eurozone Composite PMI  (Dec)",
+        "impact_raw": "bull2",
+        "currency": "EUR",
+        "actual": "51.5",
+        "forecast": "51.9",
+        "previous": "52.8",
+        "time_raw": "04:00"
+    },
+    {
+        "pid": "538093",
+        "title": "HCOB Eurozone Services PMI  (Dec)",
+        "impact_raw": "bull2",
+        "currency": "EUR",
+        "actual": "52.4",
+        "forecast": "52.6",
+        "previous": "53.6",
+        "time_raw": "04:00"
+    },
+    {
+        "pid": "538033",
+        "title": "Whole Economy PMI (MoM)  (Dec)",
+        "impact_raw": "bull1",
+        "currency": "GHS",
+        "actual": "51.10%",
+        "forecast": "",
+        "previous": "50.10%",
+        "time_raw": "04:00"
+    },
+    {
+        "pid": "539473",
+        "title": "M2 Money Supply (YoY)  (Nov)",
+        "impact_raw": "bull1",
+        "currency": "OMR",
+        "actual": "6.4%",
+        "forecast": "",
+        "previous": "3.6%",
+        "time_raw": "04:00"
+    },
+    {
+        "pid": "539474",
+        "title": "Total Credit (YoY)  (Nov)",
+        "impact_raw": "bull1",
+        "currency": "OMR",
+        "actual": "8.4%",
+        "forecast": "",
+        "previous": "8.6%",
+        "time_raw": "04:00"
+    },
+    {
+        "pid": "539470",
+        "title": "Foreign Reserves (USD)  (Dec)",
+        "impact_raw": "bull1",
+        "currency": "EGP",
+        "actual": "51.45B",
+        "forecast": "",
+        "previous": "50.22B",
+        "time_raw": "04:25"
+    },
+    {
+        "pid": "538105",
+        "title": "S&P Global Composite PMI  (Dec)",
+        "impact_raw": "bull2",
+        "currency": "GBP",
+        "actual": "51.4",
+        "forecast": "52.1",
+        "previous": "51.2",
+        "time_raw": "04:30"
+    },
+    {
+        "pid": "538106",
+        "title": "S&P Global Services PMI  (Dec)",
+        "impact_raw": "bull2",
+        "currency": "GBP",
+        "actual": "51.4",
+        "forecast": "52.1",
+        "previous": "51.3",
+        "time_raw": "04:30"
+    },
+    {
+        "pid": "539015",
+        "title": "House Price Index (YoY)  (Dec)",
+        "impact_raw": "bull1",
+        "currency": "NOK",
+        "actual": "5.00%",
+        "forecast": "",
+        "previous": "6.20%",
+        "time_raw": "05:00"
+    },
+    {
+        "pid": "539016",
+        "title": "German 2-Year Schatz Auction",
+        "impact_raw": "bull1",
+        "currency": "EUR",
+        "actual": "2.110%",
+        "forecast": "",
+        "previous": "2.050%",
+        "time_raw": "05:30"
+    },
+    {
+        "pid": "539022",
+        "title": "German Car Registration (YoY)  (Dec)",
+        "impact_raw": "bull1",
+        "currency": "EUR",
+        "actual": "9.7%",
+        "forecast": "",
+        "previous": "2.5%",
+        "time_raw": "06:00"
+    },
+    {
+        "pid": "539017",
+        "title": "Irish HICP (MoM)  (Dec)",
+        "impact_raw": "bull1",
+        "currency": "EUR",
+        "actual": "0.6%",
+        "forecast": "",
+        "previous": "-0.2%",
+        "time_raw": "06:00"
+    },
+    {
+        "pid": "539018",
+        "title": "Irish HICP (YoY)  (Dec)",
+        "impact_raw": "bull1",
+        "currency": "EUR",
+        "actual": "2.7%",
+        "forecast": "",
+        "previous": "3.1%",
+        "time_raw": "06:00"
+    },
+    {
+        "pid": "539476",
+        "title": "Budget Balance  (Dec)",
+        "impact_raw": "bull1",
+        "currency": "CZK",
+        "actual": "-290.700B",
+        "forecast": "",
+        "previous": "-232.400B",
+        "time_raw": "06:00"
+    },
+    {
+        "pid": "539164",
+        "title": "Consumer Confidence  (Dec)",
+        "impact_raw": "bull1",
+        "currency": "MXN",
+        "actual": "44.7",
+        "forecast": "",
+        "previous": "44.2",
+        "time_raw": "07:00"
+    },
+    {
+        "pid": "539165",
+        "title": "Consumer Confidence n.s.a.  (Dec)",
+        "impact_raw": "bull1",
+        "currency": "MXN",
+        "actual": "44.8",
+        "forecast": "",
+        "previous": "44.0",
+        "time_raw": "07:00"
+    },
+    {
+        "pid": "538619",
+        "title": "M2 Money Supply (YoY)  (Nov)",
+        "impact_raw": "bull1",
+        "currency": "EGP",
+        "actual": "22.00%",
+        "forecast": "",
+        "previous": "21.70%",
+        "time_raw": "07:50"
+    },
+    {
+        "pid": "539171",
+        "title": "FOMC Member Barkin Speaks",
+        "impact_raw": "bull1",
+        "currency": "USD",
+        "actual": "",
+        "forecast": "",
+        "previous": "",
+        "time_raw": "08:00"
+    },
+    {
+        "pid": "538110",
+        "title": "German CPI (MoM)  (Dec)",
+        "impact_raw": "bull3",
+        "currency": "EUR",
+        "actual": "0.0%",
+        "forecast": "0.3%",
+        "previous": "-0.2%",
+        "time_raw": "08:00"
+    },
+    {
+        "pid": "538112",
+        "title": "German CPI (YoY)  (Dec)",
+        "impact_raw": "bull2",
+        "currency": "EUR",
+        "actual": "1.8%",
+        "forecast": "2.0%",
+        "previous": "2.3%",
+        "time_raw": "08:00"
+    },
+    {
+        "pid": "538111",
+        "title": "German HICP (MoM)  (Dec)",
+        "impact_raw": "bull1",
+        "currency": "EUR",
+        "actual": "0.2%",
+        "forecast": "0.4%",
+        "previous": "-0.5%",
+        "time_raw": "08:00"
+    },
+    {
+        "pid": "538109",
+        "title": "German HICP (YoY)  (Dec)",
+        "impact_raw": "bull1",
+        "currency": "EUR",
+        "actual": "2.0%",
+        "forecast": "2.2%",
+        "previous": "2.6%",
+        "time_raw": "08:00"
+    },
+    {
+        "pid": "538049",
+        "title": "S&P Global Composite PMI  (Dec)",
+        "impact_raw": "bull1",
+        "currency": "BRL",
+        "actual": "52.1",
+        "forecast": "",
+        "previous": "49.6",
+        "time_raw": "08:00"
+    },
+    {
+        "pid": "538048",
+        "title": "S&P Global Services PMI  (Dec)",
+        "impact_raw": "bull1",
+        "currency": "BRL",
+        "actual": "53.7",
+        "forecast": "",
+        "previous": "50.1",
+        "time_raw": "08:00"
+    },
+    {
+        "pid": "538113",
+        "title": "Reserve Assets Total  (Dec)",
+        "impact_raw": "bull1",
+        "currency": "CAD",
+        "actual": "127.8B",
+        "forecast": "",
+        "previous": "127.8B",
+        "time_raw": "08:15"
+    },
+    {
+        "pid": "539019",
+        "title": "Redbook (YoY)",
+        "impact_raw": "bull1",
+        "currency": "USD",
+        "actual": "7.1%",
+        "forecast": "",
+        "previous": "7.6%",
+        "time_raw": "08:55"
+    },
+    {
+        "pid": "539479",
+        "title": "GDP (QoQ)  (Q3)",
+        "impact_raw": "bull1",
+        "currency": "KES",
+        "actual": "4.90%",
+        "forecast": "",
+        "previous": "5.00%",
+        "time_raw": "08:55"
+    },
+    {
+        "pid": "539020",
+        "title": "Services PMI  (Dec)",
+        "impact_raw": "bull1",
+        "currency": "CAD",
+        "actual": "46.50",
+        "forecast": "",
+        "previous": "44.30",
+        "time_raw": "09:30"
+    },
+    {
+        "pid": "538050",
+        "title": "S&P Global Composite PMI  (Dec)",
+        "impact_raw": "bull2",
+        "currency": "USD",
+        "actual": "52.7",
+        "forecast": "53.0",
+        "previous": "54.2",
+        "time_raw": "09:45"
+    },
+    {
+        "pid": "538051",
+        "title": "S&P Global Services PMI  (Dec)",
+        "impact_raw": "bull3",
+        "currency": "USD",
+        "actual": "52.5",
+        "forecast": "52.9",
+        "previous": "54.1",
+        "time_raw": "09:45"
+    },
+    {
+        "pid": "539493",
+        "title": "All Car Sales  (Dec)",
+        "impact_raw": "bull1",
+        "currency": "USD",
+        "actual": "2.77M",
+        "forecast": "",
+        "previous": "2.65M",
+        "time_raw": "10:00"
+    },
+    {
+        "pid": "539494",
+        "title": "All Truck Sales  (Dec)",
+        "impact_raw": "bull1",
+        "currency": "USD",
+        "actual": "13.25M",
+        "forecast": "",
+        "previous": "13.63M",
+        "time_raw": "10:00"
+    },
+    {
+        "pid": "539169",
+        "title": "German Buba Mauderer Speaks",
+        "impact_raw": "bull2",
+        "currency": "EUR",
+        "actual": "",
+        "forecast": "",
+        "previous": "",
+        "time_raw": "10:00"
+    },
+    {
+        "pid": "538124",
+        "title": "Irish Exchequer Returns  (Dec)",
+        "impact_raw": "bull1",
+        "currency": "EUR",
+        "actual": "7.100B",
+        "forecast": "",
+        "previous": "10.400B",
+        "time_raw": "11:30"
+    },
+    {
+        "pid": "539001",
+        "title": "Trade Balance  (Dec)",
+        "impact_raw": "bull1",
+        "currency": "BRL",
+        "actual": "",
+        "forecast": "6.39B",
+        "previous": "5.84B",
+        "time_raw": "13:00"
+    },
+    {
+        "pid": "539021",
+        "title": "API Weekly Crude Oil Stock",
+        "impact_raw": "bull2",
+        "currency": "USD",
+        "actual": "",
+        "forecast": "1.200M",
+        "previous": "1.700M",
+        "time_raw": "16:30"
+    },
+    {
+        "pid": "538152",
+        "title": "Building Approvals (YoY)  (Nov)",
+        "impact_raw": "bull1",
+        "currency": "AUD",
+        "actual": "",
+        "forecast": "",
+        "previous": "-1.80%",
+        "time_raw": "19:30"
+    },
+    {
+        "pid": "538154",
+        "title": "Building Approvals (MoM)  (Nov)",
+        "impact_raw": "bull2",
+        "currency": "AUD",
+        "actual": "",
+        "forecast": "1.9%",
+        "previous": "-6.4%",
+        "time_raw": "19:30"
+    },
+    {
+        "pid": "539029",
+        "title": "CPI Index Number  (Nov)",
+        "impact_raw": "bull1",
+        "currency": "AUD",
+        "actual": "",
+        "forecast": "",
+        "previous": "99.99",
+        "time_raw": "19:30"
+    },
+    {
+        "pid": "538153",
+        "title": "Private House Approvals  (Nov)",
+        "impact_raw": "bull1",
+        "currency": "AUD",
+        "actual": "",
+        "forecast": "",
+        "previous": "-2.1%",
+        "time_raw": "19:30"
+    },
+    {
+        "pid": "539027",
+        "title": "Trimmed Mean CPI (QoQ)  (Nov)",
+        "impact_raw": "bull2",
+        "currency": "AUD",
+        "actual": "",
+        "forecast": "",
+        "previous": "0.3%",
+        "time_raw": "19:30"
+    },
+    {
+        "pid": "539028",
+        "title": "Trimmed Mean CPI (YoY)  (Nov)",
+        "impact_raw": "bull1",
+        "currency": "AUD",
+        "actual": "",
+        "forecast": "",
+        "previous": "3.3%",
+        "time_raw": "19:30"
+    },
+    {
+        "pid": "539324",
+        "title": "Monthly CPI Indicator (YoY)  (Nov)",
+        "impact_raw": "bull1",
+        "currency": "AUD",
+        "actual": "",
+        "forecast": "3.60%",
+        "previous": "3.80%",
+        "time_raw": "19:30"
+    },
+    {
+        "pid": "539025",
+        "title": "Weighted mean CPI (QoQ)  (Nov)",
+        "impact_raw": "bull1",
+        "currency": "AUD",
+        "actual": "",
+        "forecast": "",
+        "previous": "0.3%",
+        "time_raw": "19:30"
+    },
+    {
+        "pid": "539026",
+        "title": "Weighted mean CPI (YoY)  (Nov)",
+        "impact_raw": "bull1",
+        "currency": "AUD",
+        "actual": "",
+        "forecast": "",
+        "previous": "3.4%",
+        "time_raw": "19:30"
+    },
+    {
+        "pid": "538007",
+        "title": "Manufacturing & Services PMI  (Dec)",
+        "impact_raw": "bull1",
+        "currency": "JPY",
+        "actual": "",
+        "forecast": "51.50",
+        "previous": "52.00",
+        "time_raw": "19:30"
+    },
+    {
+        "pid": "538008",
+        "title": "au Jibun Bank Services PMI  (Dec)",
+        "impact_raw": "bull2",
+        "currency": "JPY",
+        "actual": "",
+        "forecast": "52.5",
+        "previous": "53.2",
+        "time_raw": "19:30"
+    },
+    {
+        "pid": "538459",
+        "title": "Irish Consumer Confidence  (Dec)",
+        "impact_raw": "bull1",
+        "currency": "EUR",
+        "actual": "",
+        "forecast": "",
+        "previous": "61.0",
+        "time_raw": "22:30"
+    },
+    {
+        "pid": "538873",
+        "title": "Core CPI (YoY)  (Dec)",
+        "impact_raw": "bull1",
+        "currency": "THB",
+        "actual": "",
+        "forecast": "0.69%",
+        "previous": "0.66%",
+        "time_raw": "22:30"
+    },
+    {
+        "pid": "538874",
+        "title": "CPI (YoY)  (Dec)",
+        "impact_raw": "bull1",
+        "currency": "THB",
+        "actual": "",
+        "forecast": "-0.40%",
+        "previous": "-0.49%",
+        "time_raw": "22:30"
+    },
+    {
+        "pid": "538155",
+        "title": "Dutch Consumer Spending  (Nov)",
+        "impact_raw": "bull1",
+        "currency": "EUR",
+        "actual": "",
+        "forecast": "",
+        "previous": "0.8%",
+        "time_raw": "00:30"
+    },
+    {
+        "pid": "539030",
+        "title": "Dutch CPI (YoY)  (Dec)",
+        "impact_raw": "bull1",
+        "currency": "EUR",
+        "actual": "",
+        "forecast": "",
+        "previous": "2.9%",
+        "time_raw": "00:30"
+    },
+    {
+        "pid": "538160",
+        "title": "German Retail Sales (MoM)  (Nov)",
+        "impact_raw": "bull2",
+        "currency": "EUR",
+        "actual": "",
+        "forecast": "0.2%",
+        "previous": "-0.3%",
+        "time_raw": "02:00"
+    },
+    {
+        "pid": "538161",
+        "title": "German Retail Sales (YoY)  (Nov)",
+        "impact_raw": "bull1",
+        "currency": "EUR",
+        "actual": "",
+        "forecast": "",
+        "previous": "0.9%",
+        "time_raw": "02:00"
+    },
+    {
+        "pid": "538029",
+        "title": "Services PMI (MoM)  (Dec)",
+        "impact_raw": "bull1",
+        "currency": "SEK",
+        "actual": "",
+        "forecast": "",
+        "previous": "59.1",
+        "time_raw": "02:30"
+    },
+    {
+        "pid": "538165",
+        "title": "PPI (YoY)  (Nov)",
+        "impact_raw": "bull1",
+        "currency": "HUF",
+        "actual": "",
+        "forecast": "",
+        "previous": "1.8%",
+        "time_raw": "02:30"
+    },
+    {
+        "pid": "537598",
+        "title": "Quarterly Unemployment Rate  (Nov)",
+        "impact_raw": "bull1",
+        "currency": "HUF",
+        "actual": "",
+        "forecast": "",
+        "previous": "4.6%",
+        "time_raw": "02:30"
+    },
+    {
+        "pid": "538166",
+        "title": "French Consumer Confidence  (Dec)",
+        "impact_raw": "bull1",
+        "currency": "EUR",
+        "actual": "",
+        "forecast": "90",
+        "previous": "89",
+        "time_raw": "02:45"
+    },
+    {
+        "pid": "538170",
+        "title": "FX Reserves (USD)  (Dec)",
+        "impact_raw": "bull1",
+        "currency": "CNY",
+        "actual": "",
+        "forecast": "",
+        "previous": "3.346T",
+        "time_raw": "03:00"
+    },
+    {
+        "pid": "538171",
+        "title": "CPI NSA (MoM)  (Dec)",
+        "impact_raw": "bull1",
+        "currency": "TWD",
+        "actual": "",
+        "forecast": "",
+        "previous": "-0.14%",
+        "time_raw": "03:00"
+    },
+    {
+        "pid": "538169",
+        "title": "CPI (YoY)  (Dec)",
+        "impact_raw": "bull1",
+        "currency": "TWD",
+        "actual": "",
+        "forecast": "",
+        "previous": "1.23%",
+        "time_raw": "03:00"
+    },
+    {
+        "pid": "538168",
+        "title": "CPI (MoM)  (Dec)",
+        "impact_raw": "bull1",
+        "currency": "TWD",
+        "actual": "",
+        "forecast": "",
+        "previous": "0.09%",
+        "time_raw": "03:00"
+    },
+    {
+        "pid": "538952",
+        "title": "Austrian CPI (MoM)  (Dec)",
+        "impact_raw": "bull1",
+        "currency": "EUR",
+        "actual": "",
+        "forecast": "",
+        "previous": "0.31%",
+        "time_raw": "03:00"
+    },
+    {
+        "pid": "538953",
+        "title": "Austrian CPI (YoY)  (Dec)",
+        "impact_raw": "bull1",
+        "currency": "EUR",
+        "actual": "",
+        "forecast": "",
+        "previous": "4.02%",
+        "time_raw": "03:00"
+    },
+    {
+        "pid": "538950",
+        "title": "Austrian HICP (MoM)  (Dec)",
+        "impact_raw": "bull1",
+        "currency": "EUR",
+        "actual": "",
+        "forecast": "",
+        "previous": "0.2%",
+        "time_raw": "03:00"
+    },
+    {
+        "pid": "538951",
+        "title": "Austrian HICP (YoY)  (Dec)",
+        "impact_raw": "bull1",
+        "currency": "EUR",
+        "actual": "",
+        "forecast": "",
+        "previous": "4.0%",
+        "time_raw": "03:00"
+    },
+    {
+        "pid": "538172",
+        "title": "Austrian Wholesale Prices n.s.a (MoM)  (Dec)",
+        "impact_raw": "bull1",
+        "currency": "EUR",
+        "actual": "",
+        "forecast": "",
+        "previous": "0.9%",
+        "time_raw": "03:00"
+    },
+    {
+        "pid": "538167",
+        "title": "Austrian Wholesale Prices n.s.a (YoY)  (Dec)",
+        "impact_raw": "bull1",
+        "currency": "EUR",
+        "actual": "",
+        "forecast": "",
+        "previous": "0.9%",
+        "time_raw": "03:00"
+    },
+    {
+        "pid": "539031",
+        "title": "HCOB Italy Construction PMI (MoM)  (Dec)",
+        "impact_raw": "bull1",
+        "currency": "EUR",
+        "actual": "",
+        "forecast": "",
+        "previous": "48.2",
+        "time_raw": "03:30"
+    },
+    {
+        "pid": "538164",
+        "title": "HCOB Germany Construction PMI  (Dec)",
+        "impact_raw": "bull1",
+        "currency": "EUR",
+        "actual": "",
+        "forecast": "",
+        "previous": "45.2",
+        "time_raw": "03:30"
+    },
+    {
+        "pid": "538162",
+        "title": "HCOB France Construction PMI (MoM)  (Dec)",
+        "impact_raw": "bull1",
+        "currency": "EUR",
+        "actual": "",
+        "forecast": "",
+        "previous": "43.6",
+        "time_raw": "03:30"
+    },
+    {
+        "pid": "538173",
+        "title": "Foreign Reserves (USD)  (Dec)",
+        "impact_raw": "bull1",
+        "currency": "HKD",
+        "actual": "",
+        "forecast": "",
+        "previous": "429.40B",
+        "time_raw": "03:30"
+    },
+    {
+        "pid": "538163",
+        "title": "HCOB Eurozone Construction PMI (MoM)  (Dec)",
+        "impact_raw": "bull1",
+        "currency": "EUR",
+        "actual": "",
+        "forecast": "",
+        "previous": "45.4",
+        "time_raw": "03:30"
+    },
+    {
+        "pid": "538177",
+        "title": "German Unemployment Change  (Dec)",
+        "impact_raw": "bull2",
+        "currency": "EUR",
+        "actual": "",
+        "forecast": "5K",
+        "previous": "1K",
+        "time_raw": "03:55"
+    },
+    {
+        "pid": "538174",
+        "title": "German Unemployment Rate  (Dec)",
+        "impact_raw": "bull2",
+        "currency": "EUR",
+        "actual": "",
+        "forecast": "6.3%",
+        "previous": "6.3%",
+        "time_raw": "03:55"
+    },
+    {
+        "pid": "538175",
+        "title": "German Unemployment  (Dec)",
+        "impact_raw": "bull1",
+        "currency": "EUR",
+        "actual": "",
+        "forecast": "",
+        "previous": "2.973M",
+        "time_raw": "03:55"
+    },
+    {
+        "pid": "538176",
+        "title": "German Unemployment n.s.a.  (Dec)",
+        "impact_raw": "bull1",
+        "currency": "EUR",
+        "actual": "",
+        "forecast": "",
+        "previous": "2.885M",
+        "time_raw": "03:55"
+    },
+    {
+        "pid": "539266",
+        "title": "Italian Public Deficit  (Q3)",
+        "impact_raw": "bull1",
+        "currency": "EUR",
+        "actual": "",
+        "forecast": "",
+        "previous": "2.0%",
+        "time_raw": "04:00"
+    },
+    {
+        "pid": "539466",
+        "title": "Baden Wuerttemberg CPI (MoM)  (Dec)",
+        "impact_raw": "bull1",
+        "currency": "EUR",
+        "actual": "",
+        "forecast": "",
+        "previous": "-0.3%",
+        "time_raw": "04:00"
+    },
+    {
+        "pid": "539467",
+        "title": "Baden Wuerttemberg CPI (YoY)  (Dec)",
+        "impact_raw": "bull1",
+        "currency": "EUR",
+        "actual": "",
+        "forecast": "",
+        "previous": "2.3%",
+        "time_raw": "04:00"
+    },
+    {
+        "pid": "539468",
+        "title": "Bavaria CPI (YoY)  (Dec)",
+        "impact_raw": "bull1",
+        "currency": "EUR",
+        "actual": "",
+        "forecast": "",
+        "previous": "2.2%",
+        "time_raw": "04:00"
+    },
+    {
+        "pid": "539469",
+        "title": "Bavaria CPI (MoM)  (Dec)",
+        "impact_raw": "bull1",
+        "currency": "EUR",
+        "actual": "",
+        "forecast": "",
+        "previous": "-0.2%",
+        "time_raw": "04:00"
+    },
+    {
+        "pid": "538181",
+        "title": "Foreign Reserves USD (MoM)  (Dec)",
+        "impact_raw": "bull1",
+        "currency": "SGD",
+        "actual": "",
+        "forecast": "",
+        "previous": "400.0B",
+        "time_raw": "04:00"
+    },
+    {
+        "pid": "538179",
+        "title": "FX Reserves USD  (Dec)",
+        "impact_raw": "bull1",
+        "currency": "PHP",
+        "actual": "",
+        "forecast": "",
+        "previous": "111.10B",
+        "time_raw": "04:00"
+    },
+    {
+        "pid": "538178",
+        "title": "FX Reserves (EUR)  (Dec)",
+        "impact_raw": "bull1",
+        "currency": "CZK",
+        "actual": "",
+        "forecast": "",
+        "previous": "149.200B",
+        "time_raw": "04:00"
+    },
+    {
+        "pid": "538180",
+        "title": "FX Reserves (USD)  (Dec)",
+        "impact_raw": "bull1",
+        "currency": "CZK",
+        "actual": "",
+        "forecast": "",
+        "previous": "172.6B",
+        "time_raw": "04:00"
+    },
+    {
+        "pid": "539305",
+        "title": "CPI (YoY)  (Dec)",
+        "impact_raw": "bull1",
+        "currency": "GHS",
+        "actual": "",
+        "forecast": "",
+        "previous": "6.30%",
+        "time_raw": "04:00"
+    },
+    {
+        "pid": "538183",
+        "title": "S&P Global Construction PMI  (Dec)",
+        "impact_raw": "bull2",
+        "currency": "GBP",
+        "actual": "",
+        "forecast": "42.4",
+        "previous": "39.4",
+        "time_raw": "04:30"
+    },
+    {
+        "pid": "539238",
+        "title": "Housing Equity Withdrawal (QoQ)",
+        "impact_raw": "bull1",
+        "currency": "GBP",
+        "actual": "",
+        "forecast": "-8.7B",
+        "previous": "-16.1B",
+        "time_raw": "04:30"
+    },
+    {
+        "pid": "538191",
+        "title": "Italian CPI (MoM)  (Dec)",
+        "impact_raw": "bull1",
+        "currency": "EUR",
+        "actual": "",
+        "forecast": "0.2%",
+        "previous": "-0.2%",
+        "time_raw": "05:00"
+    },
+    {
+        "pid": "538186",
+        "title": "Italian CPI (YoY)  (Dec)",
+        "impact_raw": "bull1",
+        "currency": "EUR",
+        "actual": "",
+        "forecast": "1.1%",
+        "previous": "1.1%",
+        "time_raw": "05:00"
+    },
+    {
+        "pid": "538188",
+        "title": "Italian HICP (MoM)  (Dec)",
+        "impact_raw": "bull1",
+        "currency": "EUR",
+        "actual": "",
+        "forecast": "",
+        "previous": "-0.2%",
+        "time_raw": "05:00"
+    },
+    {
+        "pid": "538190",
+        "title": "Italian HICP (YoY)  (Dec)",
+        "impact_raw": "bull1",
+        "currency": "EUR",
+        "actual": "",
+        "forecast": "1.2%",
+        "previous": "1.1%",
+        "time_raw": "05:00"
+    },
+    {
+        "pid": "538954",
+        "title": "Core CPI (YoY)  (Dec)",
+        "impact_raw": "bull2",
+        "currency": "EUR",
+        "actual": "",
+        "forecast": "2.4%",
+        "previous": "2.4%",
+        "time_raw": "05:00"
+    },
+    {
+        "pid": "538955",
+        "title": "Core CPI (MoM)  (Dec)",
+        "impact_raw": "bull1",
+        "currency": "EUR",
+        "actual": "",
+        "forecast": "",
+        "previous": "-0.5%",
+        "time_raw": "05:00"
+    },
+    {
+        "pid": "538192",
+        "title": "CPI (YoY)  (Dec)",
+        "impact_raw": "bull3",
+        "currency": "EUR",
+        "actual": "",
+        "forecast": "2.0%",
+        "previous": "2.1%",
+        "time_raw": "05:00"
+    },
+    {
+        "pid": "538956",
+        "title": "CPI (MoM)  (Dec)",
+        "impact_raw": "bull2",
+        "currency": "EUR",
+        "actual": "",
+        "forecast": "",
+        "previous": "-0.3%",
+        "time_raw": "05:00"
+    },
+    {
+        "pid": "538189",
+        "title": "CPI, n.s.a  (Dec)",
+        "impact_raw": "bull1",
+        "currency": "EUR",
+        "actual": "",
+        "forecast": "",
+        "previous": "129.33",
+        "time_raw": "05:00"
+    },
+    {
+        "pid": "538187",
+        "title": "HICP ex Energy & Food (YoY)  (Dec)",
+        "impact_raw": "bull1",
+        "currency": "EUR",
+        "actual": "",
+        "forecast": "2.4%",
+        "previous": "2.4%",
+        "time_raw": "05:00"
+    },
+    {
+        "pid": "538957",
+        "title": "HICP ex Energy and Food (MoM)  (Dec)",
+        "impact_raw": "bull1",
+        "currency": "EUR",
+        "actual": "",
+        "forecast": "",
+        "previous": "-0.4%",
+        "time_raw": "05:00"
+    },
+    {
+        "pid": "539241",
+        "title": "5-Year Treasury Gilt Auction",
+        "impact_raw": "bull1",
+        "currency": "GBP",
+        "actual": "",
+        "forecast": "",
+        "previous": "4.093%",
+        "time_raw": "05:30"
+    },
+    {
+        "pid": "539032",
+        "title": "German 10-Year Bund Auction",
+        "impact_raw": "bull2",
+        "currency": "EUR",
+        "actual": "",
+        "forecast": "",
+        "previous": "2.670%",
+        "time_raw": "05:30"
+    },
+    {
+        "pid": "539033",
+        "title": "Irish Unemployment  (Dec)",
+        "impact_raw": "bull1",
+        "currency": "EUR",
+        "actual": "",
+        "forecast": "",
+        "previous": "4.9%",
+        "time_raw": "06:00"
+    },
+    {
+        "pid": "539036",
+        "title": "M3 Money Supply",
+        "impact_raw": "bull1",
+        "currency": "INR",
+        "actual": "",
+        "forecast": "",
+        "previous": "9.3%",
+        "time_raw": "06:30"
+    },
+    {
+        "pid": "539040",
+        "title": "FX Reserve - USD  (Dec)",
+        "impact_raw": "bull1",
+        "currency": "ILS",
+        "actual": "",
+        "forecast": "",
+        "previous": "231.425B",
+        "time_raw": "06:30"
+    },
+    {
+        "pid": "538194",
+        "title": "Copper Exports (USD)  (Dec)",
+        "impact_raw": "bull1",
+        "currency": "CLP",
+        "actual": "",
+        "forecast": "",
+        "previous": "4,282M",
+        "time_raw": "06:30"
+    },
+    {
+        "pid": "539034",
+        "title": "Exports (USD)  (Dec)",
+        "impact_raw": "bull1",
+        "currency": "CLP",
+        "actual": "",
+        "forecast": "",
+        "previous": "8,504M",
+        "time_raw": "06:30"
+    },
+    {
+        "pid": "539035",
+        "title": "Imports (USD)  (Dec)",
+        "impact_raw": "bull1",
+        "currency": "CLP",
+        "actual": "",
+        "forecast": "",
+        "previous": "6,606M",
+        "time_raw": "06:30"
+    },
+    {
+        "pid": "538195",
+        "title": "Trade Balance  (Dec)",
+        "impact_raw": "bull1",
+        "currency": "CLP",
+        "actual": "",
+        "forecast": "",
+        "previous": "1.90B",
+        "time_raw": "06:30"
+    },
+    {
+        "pid": "538645",
+        "title": "MBA 30-Year Mortgage Rate",
+        "impact_raw": "bull1",
+        "currency": "USD",
+        "actual": "",
+        "forecast": "",
+        "previous": "6.31%",
+        "time_raw": "07:00"
+    },
+    {
+        "pid": "538646",
+        "title": "MBA Mortgage Applications (WoW)",
+        "impact_raw": "bull1",
+        "currency": "USD",
+        "actual": "",
+        "forecast": "",
+        "previous": "-5.0%",
+        "time_raw": "07:00"
+    },
+    {
+        "pid": "538647",
+        "title": "MBA Purchase Index",
+        "impact_raw": "bull1",
+        "currency": "USD",
+        "actual": "",
+        "forecast": "",
+        "previous": "169.9",
+        "time_raw": "07:00"
+    },
+    {
+        "pid": "538648",
+        "title": "Mortgage Market Index",
+        "impact_raw": "bull1",
+        "currency": "USD",
+        "actual": "",
+        "forecast": "",
+        "previous": "299.8",
+        "time_raw": "07:00"
+    },
+    {
+        "pid": "538649",
+        "title": "Mortgage Refinance Index",
+        "impact_raw": "bull1",
+        "currency": "USD",
+        "actual": "",
+        "forecast": "",
+        "previous": "1,084.3",
+        "time_raw": "07:00"
+    },
+    {
+        "pid": "539037",
+        "title": "GDP Annual",
+        "impact_raw": "bull1",
+        "currency": "INR",
+        "actual": "",
+        "forecast": "",
+        "previous": "6.5%",
+        "time_raw": "07:00"
+    },
+    {
+        "pid": "539041",
+        "title": "Foreign Reserves (USD)  (Dec)",
+        "impact_raw": "bull1",
+        "currency": "UAH",
+        "actual": "",
+        "forecast": "",
+        "previous": "54.70B",
+        "time_raw": "07:00"
+    },
+    {
+        "pid": "538198",
+        "title": "FX Reserves (EUR)  (Dec)",
+        "impact_raw": "bull1",
+        "currency": "PLN",
+        "actual": "",
+        "forecast": "",
+        "previous": "229.07B",
+        "time_raw": "08:00"
+    },
+    {
+        "pid": "538199",
+        "title": "ADP Nonfarm Employment Change  (Dec)",
+        "impact_raw": "bull3",
+        "currency": "USD",
+        "actual": "",
+        "forecast": "50K",
+        "previous": "-32K",
+        "time_raw": "08:15"
+    },
+    {
+        "pid": "539475",
+        "title": "Treasury Cash Balance  (Dec)",
+        "impact_raw": "bull1",
+        "currency": "TRY",
+        "actual": "",
+        "forecast": "",
+        "previous": "56.390B",
+        "time_raw": "09:30"
+    },
+    {
+        "pid": "538749",
+        "title": "Durables Excluding Defense (MoM)  (Oct)",
+        "impact_raw": "bull1",
+        "currency": "USD",
+        "actual": "",
+        "forecast": "-1.5%",
+        "previous": "-1.5%",
+        "time_raw": "10:00"
+    },
+    {
+        "pid": "538748",
+        "title": "Durables Excluding Transport (MoM)  (Oct)",
+        "impact_raw": "bull1",
+        "currency": "USD",
+        "actual": "",
+        "forecast": "",
+        "previous": "0.2%",
+        "time_raw": "10:00"
+    },
+    {
+        "pid": "538746",
+        "title": "Factory Orders (MoM)  (Oct)",
+        "impact_raw": "bull2",
+        "currency": "USD",
+        "actual": "",
+        "forecast": "-1.2%",
+        "previous": "0.2%",
+        "time_raw": "10:00"
+    },
+    {
+        "pid": "538747",
+        "title": "Factory orders ex transportation (MoM)  (Oct)",
+        "impact_raw": "bull1",
+        "currency": "USD",
+        "actual": "",
+        "forecast": "",
+        "previous": "0.2%",
+        "time_raw": "10:00"
+    },
+    {
+        "pid": "538206",
+        "title": "ISM Non-Manufacturing Business Activity  (Dec)",
+        "impact_raw": "bull1",
+        "currency": "USD",
+        "actual": "",
+        "forecast": "",
+        "previous": "54.5",
+        "time_raw": "10:00"
+    },
+    {
+        "pid": "538207",
+        "title": "ISM Non-Manufacturing Employment  (Dec)",
+        "impact_raw": "bull2",
+        "currency": "USD",
+        "actual": "",
+        "forecast": "",
+        "previous": "48.9",
+        "time_raw": "10:00"
+    },
+    {
+        "pid": "538204",
+        "title": "ISM Non-Manufacturing New Orders  (Dec)",
+        "impact_raw": "bull1",
+        "currency": "USD",
+        "actual": "",
+        "forecast": "",
+        "previous": "52.9",
+        "time_raw": "10:00"
+    },
+    {
+        "pid": "538209",
+        "title": "ISM Non-Manufacturing PMI  (Dec)",
+        "impact_raw": "bull3",
+        "currency": "USD",
+        "actual": "",
+        "forecast": "52.2",
+        "previous": "52.6",
+        "time_raw": "10:00"
+    },
+    {
+        "pid": "538208",
+        "title": "ISM Non-Manufacturing Prices  (Dec)",
+        "impact_raw": "bull3",
+        "currency": "USD",
+        "actual": "",
+        "forecast": "",
+        "previous": "65.4",
+        "time_raw": "10:00"
+    },
+    {
+        "pid": "538210",
+        "title": "JOLTS Job Openings  (Nov)",
+        "impact_raw": "bull3",
+        "currency": "USD",
+        "actual": "",
+        "forecast": "7.640M",
+        "previous": "7.670M",
+        "time_raw": "10:00"
+    },
+    {
+        "pid": "538203",
+        "title": "Ivey PMI n.s.a  (Dec)",
+        "impact_raw": "bull1",
+        "currency": "CAD",
+        "actual": "",
+        "forecast": "",
+        "previous": "44.5",
+        "time_raw": "10:00"
+    },
+    {
+        "pid": "538205",
+        "title": "Ivey PMI  (Dec)",
+        "impact_raw": "bull2",
+        "currency": "CAD",
+        "actual": "",
+        "forecast": "49.5",
+        "previous": "48.4",
+        "time_raw": "10:00"
+    },
+    {
+        "pid": "537841",
+        "title": "GlobalDairyTrade Price Index",
+        "impact_raw": "bull1",
+        "currency": "NZD",
+        "actual": "",
+        "forecast": "",
+        "previous": "-4.4%",
+        "time_raw": "10:00"
+    },
+    {
+        "pid": "537842",
+        "title": "Milk Auctions",
+        "impact_raw": "bull1",
+        "currency": "USD",
+        "actual": "",
+        "forecast": "",
+        "previous": "3,341.0",
+        "time_raw": "10:00"
+    },
+    {
+        "pid": "538211",
+        "title": "Exports (YoY)  (Nov)",
+        "impact_raw": "bull1",
+        "currency": "COP",
+        "actual": "",
+        "forecast": "",
+        "previous": "-0.20%",
+        "time_raw": "10:00"
+    },
+    {
+        "pid": "539291",
+        "title": "Crude Oil Inventories",
+        "impact_raw": "bull3",
+        "currency": "USD",
+        "actual": "",
+        "forecast": "",
+        "previous": "-1.934M",
+        "time_raw": "10:30"
+    },
+    {
+        "pid": "539296",
+        "title": "EIA Refinery Crude Runs  (WoW)",
+        "impact_raw": "bull1",
+        "currency": "USD",
+        "actual": "",
+        "forecast": "",
+        "previous": "0.071M",
+        "time_raw": "10:30"
+    },
+    {
+        "pid": "539300",
+        "title": "Crude Oil Imports",
+        "impact_raw": "bull1",
+        "currency": "USD",
+        "actual": "",
+        "forecast": "",
+        "previous": "-0.957M",
+        "time_raw": "10:30"
+    },
+    {
+        "pid": "539299",
+        "title": "Cushing Crude Oil Inventories",
+        "impact_raw": "bull2",
+        "currency": "USD",
+        "actual": "",
+        "forecast": "",
+        "previous": "0.543M",
+        "time_raw": "10:30"
+    },
+    {
+        "pid": "539295",
+        "title": "Distillate Fuel Production",
+        "impact_raw": "bull1",
+        "currency": "USD",
+        "actual": "",
+        "forecast": "",
+        "previous": "-0.076M",
+        "time_raw": "10:30"
+    },
+    {
+        "pid": "539294",
+        "title": "EIA Weekly Distillates Stocks",
+        "impact_raw": "bull1",
+        "currency": "USD",
+        "actual": "",
+        "forecast": "",
+        "previous": "4.977M",
+        "time_raw": "10:30"
+    },
+    {
+        "pid": "539293",
+        "title": "Gasoline Production",
+        "impact_raw": "bull1",
+        "currency": "USD",
+        "actual": "",
+        "forecast": "",
+        "previous": "-0.352M",
+        "time_raw": "10:30"
+    },
+    {
+        "pid": "539297",
+        "title": "Heating Oil Stockpiles",
+        "impact_raw": "bull1",
+        "currency": "USD",
+        "actual": "",
+        "forecast": "",
+        "previous": "0.134M",
+        "time_raw": "10:30"
+    },
+    {
+        "pid": "539298",
+        "title": "EIA Weekly Refinery Utilization Rates (WoW)",
+        "impact_raw": "bull1",
+        "currency": "USD",
+        "actual": "",
+        "forecast": "",
+        "previous": "0.1%",
+        "time_raw": "10:30"
+    },
+    {
+        "pid": "539292",
+        "title": "Gasoline Inventories",
+        "impact_raw": "bull1",
+        "currency": "USD",
+        "actual": "",
+        "forecast": "",
+        "previous": "5.845M",
+        "time_raw": "10:30"
+    },
+    {
+        "pid": "538902",
+        "title": "Foreign Exchange Flows",
+        "impact_raw": "bull1",
+        "currency": "BRL",
+        "actual": "",
+        "forecast": "",
+        "previous": "-5.047B",
+        "time_raw": "12:30"
+    },
+    {
+        "pid": "539170",
+        "title": "FOMC Member Bowman Speaks",
+        "impact_raw": "bull2",
+        "currency": "USD",
+        "actual": "",
+        "forecast": "",
+        "previous": "",
+        "time_raw": "16:10"
+    },
+    {
+        "pid": "538215",
+        "title": "Overall wage income of employees  (Nov)",
+        "impact_raw": "bull1",
+        "currency": "JPY",
+        "actual": "",
+        "forecast": "2.3%",
+        "previous": "2.6%",
+        "time_raw": "18:30"
+    },
+    {
+        "pid": "538216",
+        "title": "Overtime Pay (YoY)  (Nov)",
+        "impact_raw": "bull1",
+        "currency": "JPY",
+        "actual": "",
+        "forecast": "",
+        "previous": "1.50%",
+        "time_raw": "18:30"
+    },
+    {
+        "pid": "539168",
+        "title": "Foreign Bonds Buying",
+        "impact_raw": "bull1",
+        "currency": "JPY",
+        "actual": "",
+        "forecast": "",
+        "previous": "103.0B",
+        "time_raw": "18:50"
+    },
+    {
+        "pid": "539167",
+        "title": "Foreign Investments in Japanese Stocks",
+        "impact_raw": "bull1",
+        "currency": "JPY",
+        "actual": "",
+        "forecast": "",
+        "previous": "-1,234.8B",
+        "time_raw": "18:50"
+    },
+    {
+        "pid": "539043",
+        "title": "Exports (MoM)  (Nov)",
+        "impact_raw": "bull1",
+        "currency": "AUD",
+        "actual": "",
+        "forecast": "",
+        "previous": "3.4%",
+        "time_raw": "19:30"
+    },
+    {
+        "pid": "539044",
+        "title": "Imports (MoM)  (Nov)",
+        "impact_raw": "bull1",
+        "currency": "AUD",
+        "actual": "",
+        "forecast": "",
+        "previous": "2.0%",
+        "time_raw": "19:30"
+    },
+    {
+        "pid": "539042",
+        "title": "Trade Balance  (Nov)",
+        "impact_raw": "bull2",
+        "currency": "AUD",
+        "actual": "",
+        "forecast": "5.550B",
+        "previous": "4.385B",
+        "time_raw": "19:30"
+    },
+    {
+        "pid": "539062",
+        "title": "FX Reserves (USD)  (Dec)",
+        "impact_raw": "bull1",
+        "currency": "IDR",
+        "actual": "",
+        "forecast": "",
+        "previous": "150.10B",
+        "time_raw": "22:00"
+    },
+    {
+        "pid": "539045",
+        "title": "30-Year JGB Auction",
+        "impact_raw": "bull1",
+        "currency": "JPY",
+        "actual": "",
+        "forecast": "",
+        "previous": "3.427%",
+        "time_raw": "22:35"
+    },
+    {
+        "pid": "539330",
+        "title": "Consumer Confidence  (Dec)",
+        "impact_raw": "bull1",
+        "currency": "THB",
+        "actual": "",
+        "forecast": "",
+        "previous": "53.2",
+        "time_raw": "23:00"
+    },
+    {
+        "pid": "538217",
+        "title": "Household Confidence  (Dec)",
+        "impact_raw": "bull1",
+        "currency": "JPY",
+        "actual": "",
+        "forecast": "37.8",
+        "previous": "37.5",
+        "time_raw": "00:00"
+    },
+    {
+        "pid": "538219",
+        "title": "Estonian CPI (MoM)  (Dec)",
+        "impact_raw": "bull1",
+        "currency": "EUR",
+        "actual": "",
+        "forecast": "",
+        "previous": "-0.20%",
+        "time_raw": "01:00"
+    },
+    {
+        "pid": "538218",
+        "title": "Estonian CPI (YoY)  (Dec)",
+        "impact_raw": "bull1",
+        "currency": "EUR",
+        "actual": "",
+        "forecast": "",
+        "previous": "4.90%",
+        "time_raw": "01:00"
+    },
+    {
+        "pid": "538221",
+        "title": "Foreign Reserves (USD)  (Dec)",
+        "impact_raw": "bull1",
+        "currency": "ZAR",
+        "actual": "",
+        "forecast": "",
+        "previous": "72.07B",
+        "time_raw": "01:00"
+    },
+    {
+        "pid": "538220",
+        "title": "Net FX Reserves  (USD)  (Dec)",
+        "impact_raw": "bull1",
+        "currency": "ZAR",
+        "actual": "",
+        "forecast": "",
+        "previous": "70.024B",
+        "time_raw": "01:00"
+    },
+    {
+        "pid": "538224",
+        "title": "Halifax House Price Index (MoM)  (Dec)",
+        "impact_raw": "bull2",
+        "currency": "GBP",
+        "actual": "",
+        "forecast": "0.1%",
+        "previous": "0.0%",
+        "time_raw": "02:00"
+    },
+    {
+        "pid": "538227",
+        "title": "Halifax House Price Index (YoY)  (Dec)",
+        "impact_raw": "bull2",
+        "currency": "GBP",
+        "actual": "",
+        "forecast": "",
+        "previous": "0.7%",
+        "time_raw": "02:00"
+    },
+    {
+        "pid": "539048",
+        "title": "CPI (YoY)  (Dec)",
+        "impact_raw": "bull2",
+        "currency": "SEK",
+        "actual": "",
+        "forecast": "0.5%",
+        "previous": "0.3%",
+        "time_raw": "02:00"
+    },
+    {
+        "pid": "539049",
+        "title": "CPI (MoM)  (Dec)",
+        "impact_raw": "bull2",
+        "currency": "SEK",
+        "actual": "",
+        "forecast": "",
+        "previous": "-0.4%",
+        "time_raw": "02:00"
+    },
+    {
+        "pid": "539046",
+        "title": "CPIF (CPI at constant interest rates) (MoM)  (Dec)",
+        "impact_raw": "bull1",
+        "currency": "SEK",
+        "actual": "",
+        "forecast": "",
+        "previous": "-0.2%",
+        "time_raw": "02:00"
+    },
+    {
+        "pid": "539047",
+        "title": "CPIF (CPI at constant interest rates) (YoY)  (Dec)",
+        "impact_raw": "bull1",
+        "currency": "SEK",
+        "actual": "",
+        "forecast": "2.5%",
+        "previous": "2.3%",
+        "time_raw": "02:00"
+    },
+    {
+        "pid": "538228",
+        "title": "German Factory Orders (MoM)  (Nov)",
+        "impact_raw": "bull2",
+        "currency": "EUR",
+        "actual": "",
+        "forecast": "-0.9%",
+        "previous": "1.5%",
+        "time_raw": "02:00"
+    },
+    {
+        "pid": "538225",
+        "title": "Unemployment Rate  (Nov)",
+        "impact_raw": "bull1",
+        "currency": "DKK",
+        "actual": "",
+        "forecast": "",
+        "previous": "2.6%",
+        "time_raw": "02:00"
+    },
+    {
+        "pid": "539253",
+        "title": "FX Reserves USD",
+        "impact_raw": "bull1",
+        "currency": "MYR",
+        "actual": "",
+        "forecast": "",
+        "previous": "124.3B",
+        "time_raw": "02:00"
+    },
+    {
+        "pid": "538223",
+        "title": "Manufacturing Production (MoM)  (Nov)",
+        "impact_raw": "bull1",
+        "currency": "NOK",
+        "actual": "",
+        "forecast": "",
+        "previous": "-0.9%",
+        "time_raw": "02:00"
+    },
+    {
+        "pid": "538226",
+        "title": "Finnish Trade Balance  (Nov)",
+        "impact_raw": "bull1",
+        "currency": "EUR",
+        "actual": "",
+        "forecast": "",
+        "previous": "0.16B",
+        "time_raw": "02:00"
+    },
+    {
+        "pid": "539248",
+        "title": "PPI (YoY)  (Nov)",
+        "impact_raw": "bull1",
+        "currency": "RON",
+        "actual": "",
+        "forecast": "",
+        "previous": "8.00%",
+        "time_raw": "02:00"
+    },
+    {
+        "pid": "538229",
+        "title": "CPI (MoM)  (Dec)",
+        "impact_raw": "bull2",
+        "currency": "CHF",
+        "actual": "",
+        "forecast": "0.0%",
+        "previous": "-0.2%",
+        "time_raw": "02:30"
+    },
+    {
+        "pid": "538230",
+        "title": "CPI (YoY)  (Dec)",
+        "impact_raw": "bull1",
+        "currency": "CHF",
+        "actual": "",
+        "forecast": "0.1%",
+        "previous": "0.0%",
+        "time_raw": "02:30"
+    },
+    {
+        "pid": "538864",
+        "title": "French Current Account  (Nov)",
+        "impact_raw": "bull1",
+        "currency": "EUR",
+        "actual": "",
+        "forecast": "",
+        "previous": "1.10B",
+        "time_raw": "02:45"
+    },
+    {
+        "pid": "538232",
+        "title": "French Exports  (Nov)",
+        "impact_raw": "bull1",
+        "currency": "EUR",
+        "actual": "",
+        "forecast": "",
+        "previous": "51.7B",
+        "time_raw": "02:45"
+    },
+    {
+        "pid": "538234",
+        "title": "French Imports  (Nov)",
+        "impact_raw": "bull1",
+        "currency": "EUR",
+        "actual": "",
+        "forecast": "",
+        "previous": "55.6B",
+        "time_raw": "02:45"
+    },
+    {
+        "pid": "538231",
+        "title": "French Reserve Assets Total  (Dec)",
+        "impact_raw": "bull1",
+        "currency": "EUR",
+        "actual": "",
+        "forecast": "",
+        "previous": "359,393.0M",
+        "time_raw": "02:45"
+    },
+    {
+        "pid": "538233",
+        "title": "French Trade Balance  (Nov)",
+        "impact_raw": "bull1",
+        "currency": "EUR",
+        "actual": "",
+        "forecast": "-4.3B",
+        "previous": "-3.9B",
+        "time_raw": "02:45"
+    },
+    {
+        "pid": "538236",
+        "title": "Industrial Production (YoY)  (Nov)",
+        "impact_raw": "bull1",
+        "currency": "CZK",
+        "actual": "",
+        "forecast": "",
+        "previous": "1.1%",
+        "time_raw": "03:00"
+    },
+    {
+        "pid": "538237",
+        "title": "CPI (MoM)  (Dec)",
+        "impact_raw": "bull1",
+        "currency": "NAD",
+        "actual": "",
+        "forecast": "",
+        "previous": "0.00%",
+        "time_raw": "03:00"
+    },
+    {
+        "pid": "538235",
+        "title": "CPI (YoY)  (Dec)",
+        "impact_raw": "bull1",
+        "currency": "NAD",
+        "actual": "",
+        "forecast": "",
+        "previous": "3.40%",
+        "time_raw": "03:00"
+    },
+    {
+        "pid": "539051",
+        "title": "SNB Monetary Policy Assessment",
+        "impact_raw": "bull2",
+        "currency": "CHF",
+        "actual": "",
+        "forecast": "",
+        "previous": "",
+        "time_raw": "03:30"
+    },
+    {
+        "pid": "539321",
+        "title": "ECB's De Guindos Speaks",
+        "impact_raw": "bull2",
+        "currency": "EUR",
+        "actual": "",
+        "forecast": "",
+        "previous": "",
+        "time_raw": "03:30"
+    },
+    {
+        "pid": "538240",
+        "title": "Italian Monthly Unemployment Rate  (Nov)",
+        "impact_raw": "bull1",
+        "currency": "EUR",
+        "actual": "",
+        "forecast": "6.0%",
+        "previous": "6.0%",
+        "time_raw": "04:00"
+    },
+    {
+        "pid": "539052",
+        "title": "Manufacturing PMI  (Dec)",
+        "impact_raw": "bull1",
+        "currency": "ZAR",
+        "actual": "",
+        "forecast": "",
+        "previous": "42.0",
+        "time_raw": "04:00"
+    },
+    {
+        "pid": "539244",
+        "title": "Spanish 10-Year Obligacion Auction",
+        "impact_raw": "bull1",
+        "currency": "EUR",
+        "actual": "",
+        "forecast": "",
+        "previous": "3.199%",
+        "time_raw": "04:40"
+    },
+    {
+        "pid": "539242",
+        "title": "Spanish 3-Year Bonos Auction",
+        "impact_raw": "bull1",
+        "currency": "EUR",
+        "actual": "",
+        "forecast": "",
+        "previous": "2.212%",
+        "time_raw": "04:40"
+    },
+    {
+        "pid": "539243",
+        "title": "Spanish 5-Year Bonos Auction",
+        "impact_raw": "bull1",
+        "currency": "EUR",
+        "actual": "",
+        "forecast": "",
+        "previous": "2.471%",
+        "time_raw": "04:40"
+    },
+    {
+        "pid": "539053",
+        "title": "Mortgage Rate (GBP)  (Dec)",
+        "impact_raw": "bull2",
+        "currency": "GBP",
+        "actual": "",
+        "forecast": "",
+        "previous": "6.81%",
+        "time_raw": "05:00"
+    },
+    {
+        "pid": "538245",
+        "title": "Business and Consumer Survey  (Dec)",
+        "impact_raw": "bull1",
+        "currency": "EUR",
+        "actual": "",
+        "forecast": "96.9",
+        "previous": "97.0",
+        "time_raw": "05:00"
+    },
+    {
+        "pid": "538243",
+        "title": "Business Climate  (Dec)",
+        "impact_raw": "bull1",
+        "currency": "EUR",
+        "actual": "",
+        "forecast": "",
+        "previous": "-0.66",
+        "time_raw": "05:00"
+    },
+    {
+        "pid": "538249",
+        "title": "Consumer Confidence  (Dec)",
+        "impact_raw": "bull1",
+        "currency": "EUR",
+        "actual": "",
+        "forecast": "-14.6",
+        "previous": "-14.6",
+        "time_raw": "05:00"
+    },
+    {
+        "pid": "538242",
+        "title": "Consumer Inflation Expectation  (Dec)",
+        "impact_raw": "bull1",
+        "currency": "EUR",
+        "actual": "",
+        "forecast": "",
+        "previous": "23.1",
+        "time_raw": "05:00"
+    },
+    {
+        "pid": "538244",
+        "title": "Selling Price Expectations  (Dec)",
+        "impact_raw": "bull1",
+        "currency": "EUR",
+        "actual": "",
+        "forecast": "",
+        "previous": "9.9",
+        "time_raw": "05:00"
+    },
+    {
+        "pid": "538247",
+        "title": "Services Sentiment  (Dec)",
+        "impact_raw": "bull1",
+        "currency": "EUR",
+        "actual": "",
+        "forecast": "5.9",
+        "previous": "5.7",
+        "time_raw": "05:00"
+    },
+    {
+        "pid": "538246",
+        "title": "Industrial Sentiment  (Dec)",
+        "impact_raw": "bull1",
+        "currency": "EUR",
+        "actual": "",
+        "forecast": "-9.0",
+        "previous": "-9.3",
+        "time_raw": "05:00"
+    },
+    {
+        "pid": "538250",
+        "title": "PPI (MoM)  (Nov)",
+        "impact_raw": "bull1",
+        "currency": "EUR",
+        "actual": "",
+        "forecast": "0.4%",
+        "previous": "0.1%",
+        "time_raw": "05:00"
+    },
+    {
+        "pid": "538241",
+        "title": "PPI (YoY)  (Nov)",
+        "impact_raw": "bull1",
+        "currency": "EUR",
+        "actual": "",
+        "forecast": "",
+        "previous": "-0.5%",
+        "time_raw": "05:00"
+    },
+    {
+        "pid": "538248",
+        "title": "Unemployment Rate  (Nov)",
+        "impact_raw": "bull2",
+        "currency": "EUR",
+        "actual": "",
+        "forecast": "6.4%",
+        "previous": "6.4%",
+        "time_raw": "05:00"
+    },
+    {
+        "pid": "539063",
+        "title": "CPI (YoY)  (Dec)",
+        "impact_raw": "bull1",
+        "currency": "GHS",
+        "actual": "",
+        "forecast": "",
+        "previous": "6.30%",
+        "time_raw": "05:00"
+    },
+    {
+        "pid": "539064",
+        "title": "Budget Balance  (Dec)",
+        "impact_raw": "bull1",
+        "currency": "HUF",
+        "actual": "",
+        "forecast": "",
+        "previous": "-403.0B",
+        "time_raw": "05:00"
+    },
+    {
+        "pid": "539080",
+        "title": "Core CPI (MoM)  (Dec)",
+        "impact_raw": "bull1",
+        "currency": "CLP",
+        "actual": "",
+        "forecast": "",
+        "previous": "3.0%",
+        "time_raw": "06:00"
+    },
+    {
+        "pid": "538257",
+        "title": "CPI (MoM)  (Dec)",
+        "impact_raw": "bull1",
+        "currency": "CLP",
+        "actual": "",
+        "forecast": "-0.1%",
+        "previous": "0.3%",
+        "time_raw": "06:00"
+    },
+    {
+        "pid": "538259",
+        "title": "IGP-DI Inflation Index (MoM)  (Dec)",
+        "impact_raw": "bull1",
+        "currency": "BRL",
+        "actual": "",
+        "forecast": "",
+        "previous": "0.01%",
+        "time_raw": "06:00"
+    },
+    {
+        "pid": "538254",
+        "title": "CPI (MoM)  (Dec)",
+        "impact_raw": "bull1",
+        "currency": "AOA",
+        "actual": "",
+        "forecast": "",
+        "previous": "0.85%",
+        "time_raw": "06:00"
+    },
+    {
+        "pid": "538255",
+        "title": "CPI (YoY)  (Dec)",
+        "impact_raw": "bull1",
+        "currency": "AOA",
+        "actual": "",
+        "forecast": "",
+        "previous": "16.56%",
+        "time_raw": "06:00"
+    },
+    {
+        "pid": "539054",
+        "title": "Latvian Industrial Production (YoY)  (Nov)",
+        "impact_raw": "bull1",
+        "currency": "EUR",
+        "actual": "",
+        "forecast": "",
+        "previous": "8.8%",
+        "time_raw": "06:00"
+    },
+    {
+        "pid": "539055",
+        "title": "Latvian Industrial Production (MoM)  (Nov)",
+        "impact_raw": "bull1",
+        "currency": "EUR",
+        "actual": "",
+        "forecast": "",
+        "previous": "1.4%",
+        "time_raw": "06:00"
+    },
+    {
+        "pid": "538258",
+        "title": "Manufacturing Production (MoM)  (Nov)",
+        "impact_raw": "bull1",
+        "currency": "ZAR",
+        "actual": "",
+        "forecast": "",
+        "previous": "1.0%",
+        "time_raw": "06:00"
+    },
+    {
+        "pid": "538256",
+        "title": "Manufacturing Production (YoY)  (Nov)",
+        "impact_raw": "bull1",
+        "currency": "ZAR",
+        "actual": "",
+        "forecast": "",
+        "previous": "0.2%",
+        "time_raw": "06:00"
+    },
+    {
+        "pid": "538933",
+        "title": "Gross FX Reserves",
+        "impact_raw": "bull1",
+        "currency": "TRY",
+        "actual": "",
+        "forecast": "",
+        "previous": "",
+        "time_raw": "06:30"
+    },
+    {
+        "pid": "538265",
+        "title": "Core CPI (MoM)  (Dec)",
+        "impact_raw": "bull1",
+        "currency": "MXN",
+        "actual": "",
+        "forecast": "0.42%",
+        "previous": "0.19%",
+        "time_raw": "07:00"
+    },
+    {
+        "pid": "538263",
+        "title": "CPI (YoY)  (Dec)",
+        "impact_raw": "bull2",
+        "currency": "MXN",
+        "actual": "",
+        "forecast": "3.90%",
+        "previous": "3.80%",
+        "time_raw": "07:00"
+    },
+    {
+        "pid": "538266",
+        "title": "CPI (MoM)  (Dec)",
+        "impact_raw": "bull2",
+        "currency": "MXN",
+        "actual": "",
+        "forecast": "0.48%",
+        "previous": "0.66%",
+        "time_raw": "07:00"
+    },
+    {
+        "pid": "538264",
+        "title": "Month Core Inflation (YoY)  (Dec)",
+        "impact_raw": "bull1",
+        "currency": "MXN",
+        "actual": "",
+        "forecast": "4.37%",
+        "previous": "4.43%",
+        "time_raw": "07:00"
+    },
+    {
+        "pid": "538268",
+        "title": "PPI (MoM)  (Dec)",
+        "impact_raw": "bull1",
+        "currency": "MXN",
+        "actual": "",
+        "forecast": "",
+        "previous": "0.40%",
+        "time_raw": "07:00"
+    },
+    {
+        "pid": "538269",
+        "title": "PPI (YoY)  (Dec)",
+        "impact_raw": "bull1",
+        "currency": "MXN",
+        "actual": "",
+        "forecast": "",
+        "previous": "2.40%",
+        "time_raw": "07:00"
+    },
+    {
+        "pid": "538267",
+        "title": "Industrial Production (YoY)  (Nov)",
+        "impact_raw": "bull2",
+        "currency": "BRL",
+        "actual": "",
+        "forecast": "0.3%",
+        "previous": "-0.5%",
+        "time_raw": "07:00"
+    },
+    {
+        "pid": "538270",
+        "title": "Industrial Production (MoM)  (Nov)",
+        "impact_raw": "bull1",
+        "currency": "BRL",
+        "actual": "",
+        "forecast": "0.3%",
+        "previous": "0.1%",
+        "time_raw": "07:00"
+    },
+    {
+        "pid": "539239",
+        "title": "Challenger Job Cuts (YoY)",
+        "impact_raw": "bull1",
+        "currency": "USD",
+        "actual": "",
+        "forecast": "",
+        "previous": "23.5%",
+        "time_raw": "07:30"
+    },
+    {
+        "pid": "538276",
+        "title": "Challenger Job Cuts  (Dec)",
+        "impact_raw": "bull1",
+        "currency": "USD",
+        "actual": "",
+        "forecast": "",
+        "previous": "71.321K",
+        "time_raw": "07:30"
+    },
+    {
+        "pid": "538926",
+        "title": "Continuing Jobless Claims",
+        "impact_raw": "bull2",
+        "currency": "USD",
+        "actual": "",
+        "forecast": "",
+        "previous": "1,866K",
+        "time_raw": "08:30"
+    },
+    {
+        "pid": "539056",
+        "title": "Exports  (Oct)",
+        "impact_raw": "bull2",
+        "currency": "USD",
+        "actual": "",
+        "forecast": "",
+        "previous": "289.30B",
+        "time_raw": "08:30"
+    },
+    {
+        "pid": "539057",
+        "title": "Imports  (Oct)",
+        "impact_raw": "bull2",
+        "currency": "USD",
+        "actual": "",
+        "forecast": "",
+        "previous": "342.10B",
+        "time_raw": "08:30"
+    },
+    {
+        "pid": "538925",
+        "title": "Initial Jobless Claims",
+        "impact_raw": "bull3",
+        "currency": "USD",
+        "actual": "",
+        "forecast": "216K",
+        "previous": "199K",
+        "time_raw": "08:30"
+    },
+    {
+        "pid": "538927",
+        "title": "Jobless Claims 4-Week Avg.",
+        "impact_raw": "bull1",
+        "currency": "USD",
+        "actual": "",
+        "forecast": "",
+        "previous": "218.75K",
+        "time_raw": "08:30"
+    },
+    {
+        "pid": "536202",
+        "title": "Nonfarm Productivity (QoQ)  (Q3)",
+        "impact_raw": "bull2",
+        "currency": "USD",
+        "actual": "",
+        "forecast": "3.7%",
+        "previous": "3.3%",
+        "time_raw": "08:30"
+    },
+    {
+        "pid": "538444",
+        "title": "Trade Balance  (Oct)",
+        "impact_raw": "bull2",
+        "currency": "USD",
+        "actual": "",
+        "forecast": "-58.50B",
+        "previous": "-52.80B",
+        "time_raw": "08:30"
+    },
+    {
+        "pid": "536201",
+        "title": "Unit Labor Costs (QoQ)  (Q3)",
+        "impact_raw": "bull2",
+        "currency": "USD",
+        "actual": "",
+        "forecast": "0.5%",
+        "previous": "1.0%",
+        "time_raw": "08:30"
+    },
+    {
+        "pid": "538278",
+        "title": "Exports  (Oct)",
+        "impact_raw": "bull1",
+        "currency": "CAD",
+        "actual": "",
+        "forecast": "",
+        "previous": "64.23B",
+        "time_raw": "08:30"
+    },
+    {
+        "pid": "538277",
+        "title": "Imports  (Oct)",
+        "impact_raw": "bull1",
+        "currency": "CAD",
+        "actual": "",
+        "forecast": "",
+        "previous": "64.08B",
+        "time_raw": "08:30"
+    },
+    {
+        "pid": "538279",
+        "title": "Trade Balance  (Oct)",
+        "impact_raw": "bull2",
+        "currency": "CAD",
+        "actual": "",
+        "forecast": "-1.50B",
+        "previous": "0.15B",
+        "time_raw": "08:30"
+    },
+    {
+        "pid": "539081",
+        "title": "Treasury Cash Balance  (Dec)",
+        "impact_raw": "bull1",
+        "currency": "TRY",
+        "actual": "",
+        "forecast": "",
+        "previous": "56.390B",
+        "time_raw": "09:30"
+    },
+    {
+        "pid": "538757",
+        "title": "Wholesale Inventories (MoM)  (Oct)",
+        "impact_raw": "bull1",
+        "currency": "USD",
+        "actual": "",
+        "forecast": "0.2%",
+        "previous": "0.5%",
+        "time_raw": "10:00"
+    },
+    {
+        "pid": "538756",
+        "title": "Wholesale Trade Sales (MoM)  (Oct)",
+        "impact_raw": "bull1",
+        "currency": "USD",
+        "actual": "",
+        "forecast": "",
+        "previous": "-0.2%",
+        "time_raw": "10:00"
+    },
+    {
+        "pid": "539058",
+        "title": "Monetary Policy Meeting Minutes",
+        "impact_raw": "bull2",
+        "currency": "MXN",
+        "actual": "",
+        "forecast": "",
+        "previous": "",
+        "time_raw": "10:00"
+    },
+    {
+        "pid": "538932",
+        "title": "Natural Gas Storage",
+        "impact_raw": "bull1",
+        "currency": "USD",
+        "actual": "",
+        "forecast": "",
+        "previous": "-38B",
+        "time_raw": "10:30"
+    },
+    {
+        "pid": "539059",
+        "title": "NY Fed 1-Year Consumer Inflation Expectations  (Dec)",
+        "impact_raw": "bull2",
+        "currency": "USD",
+        "actual": "",
+        "forecast": "",
+        "previous": "3.2%",
+        "time_raw": "11:00"
+    },
+    {
+        "pid": "538928",
+        "title": "4-Week Bill Auction",
+        "impact_raw": "bull1",
+        "currency": "USD",
+        "actual": "",
+        "forecast": "",
+        "previous": "3.590%",
+        "time_raw": "11:30"
+    },
+    {
+        "pid": "538929",
+        "title": "8-Week Bill Auction",
+        "impact_raw": "bull1",
+        "currency": "USD",
+        "actual": "",
+        "forecast": "",
+        "previous": "3.580%",
+        "time_raw": "11:30"
+    },
+    {
+        "pid": "539178",
+        "title": "Atlanta Fed GDPNow  (Q4)",
+        "impact_raw": "bull2",
+        "currency": "USD",
+        "actual": "",
+        "forecast": "2.7%",
+        "previous": "2.7%",
+        "time_raw": "12:00"
+    },
+    {
+        "pid": "538292",
+        "title": "Industrial Production (YoY)  (Nov)",
+        "impact_raw": "bull1",
+        "currency": "ARS",
+        "actual": "",
+        "forecast": "",
+        "previous": "-2.9%",
+        "time_raw": "14:00"
+    },
+    {
+        "pid": "538293",
+        "title": "Consumer Credit  (Nov)",
+        "impact_raw": "bull2",
+        "currency": "USD",
+        "actual": "",
+        "forecast": "10.30B",
+        "previous": "9.18B",
+        "time_raw": "15:00"
+    },
+    {
+        "pid": "539443",
+        "title": "Fed's Balance Sheet",
+        "impact_raw": "bull2",
+        "currency": "USD",
+        "actual": "",
+        "forecast": "",
+        "previous": "6,641B",
+        "time_raw": "16:30"
+    },
+    {
+        "pid": "539444",
+        "title": "Reserve Balances with Federal Reserve Banks",
+        "impact_raw": "bull1",
+        "currency": "USD",
+        "actual": "",
+        "forecast": "",
+        "previous": "2.853T",
+        "time_raw": "16:30"
+    },
+    {
+        "pid": "538882",
+        "title": "Current Account  (Nov)",
+        "impact_raw": "bull1",
+        "currency": "KRW",
+        "actual": "",
+        "forecast": "",
+        "previous": "6.81B",
+        "time_raw": "18:00"
+    },
+    {
+        "pid": "539061",
+        "title": "CPI (YoY)  (Dec)",
+        "impact_raw": "bull1",
+        "currency": "COP",
+        "actual": "",
+        "forecast": "5.20%",
+        "previous": "5.30%",
+        "time_raw": "18:00"
+    },
+    {
+        "pid": "539060",
+        "title": "CPI (MoM)  (Dec)",
+        "impact_raw": "bull1",
+        "currency": "COP",
+        "actual": "",
+        "forecast": "0.38%",
+        "previous": "0.07%",
+        "time_raw": "18:00"
+    },
+    {
+        "pid": "538294",
+        "title": "Interest Rate Decision  (Jan)",
+        "impact_raw": "bull1",
+        "currency": "PEN",
+        "actual": "",
+        "forecast": "",
+        "previous": "4.25%",
+        "time_raw": "18:00"
+    },
+    {
+        "pid": "538296",
+        "title": "Household Spending (YoY)  (Nov)",
+        "impact_raw": "bull2",
+        "currency": "JPY",
+        "actual": "",
+        "forecast": "-1.0%",
+        "previous": "-2.9%",
+        "time_raw": "18:30"
+    },
+    {
+        "pid": "538295",
+        "title": "Household Spending (MoM)  (Nov)",
+        "impact_raw": "bull2",
+        "currency": "JPY",
+        "actual": "",
+        "forecast": "",
+        "previous": "-3.5%",
+        "time_raw": "18:30"
+    },
+    {
+        "pid": "539083",
+        "title": "Motorbike Sales (YoY)  (Dec)",
+        "impact_raw": "bull1",
+        "currency": "IDR",
+        "actual": "",
+        "forecast": "",
+        "previous": "2.10%",
+        "time_raw": "18:30"
+    },
+    {
+        "pid": "539084",
+        "title": "Foreign Reserves (USD)  (Dec)",
+        "impact_raw": "bull1",
+        "currency": "JPY",
+        "actual": "",
+        "forecast": "",
+        "previous": "1,359.4B",
+        "time_raw": "18:50"
+    },
+    {
+        "pid": "539307",
+        "title": "Foreign Reserves (USD)  (Dec)",
+        "impact_raw": "bull1",
+        "currency": "JPY",
+        "actual": "",
+        "forecast": "",
+        "previous": "1,359.4B",
+        "time_raw": "18:50"
+    },
+    {
+        "pid": "539099",
+        "title": "Philippines Foreign Direct Investment (USD)  (Oct)",
+        "impact_raw": "bull1",
+        "currency": "PHP",
+        "actual": "",
+        "forecast": "",
+        "previous": "0.30B",
+        "time_raw": "20:00"
+    },
+    {
+        "pid": "538847",
+        "title": "CPI (YoY)  (Dec)",
+        "impact_raw": "bull2",
+        "currency": "CNY",
+        "actual": "",
+        "forecast": "0.8%",
+        "previous": "0.7%",
+        "time_raw": "20:30"
+    },
+    {
+        "pid": "538848",
+        "title": "CPI (MoM)  (Dec)",
+        "impact_raw": "bull2",
+        "currency": "CNY",
+        "actual": "",
+        "forecast": "",
+        "previous": "-0.1%",
+        "time_raw": "20:30"
+    },
+    {
+        "pid": "538849",
+        "title": "PPI (YoY)  (Dec)",
+        "impact_raw": "bull2",
+        "currency": "CNY",
+        "actual": "",
+        "forecast": "-1.5%",
+        "previous": "-2.2%",
+        "time_raw": "20:30"
+    },
+    {
+        "pid": "539102",
+        "title": "Consumer Confidence  (Dec)",
+        "impact_raw": "bull1",
+        "currency": "IDR",
+        "actual": "",
+        "forecast": "",
+        "previous": "124.0",
+        "time_raw": "22:00"
+    },
+    {
+        "pid": "538302",
+        "title": "Industrial Production (YoY)  (Nov)",
+        "impact_raw": "bull1",
+        "currency": "MYR",
+        "actual": "",
+        "forecast": "",
+        "previous": "6.0%",
+        "time_raw": "23:00"
+    },
+    {
+        "pid": "539085",
+        "title": "Unemployment Rate  (Nov)",
+        "impact_raw": "bull1",
+        "currency": "MYR",
+        "actual": "",
+        "forecast": "",
+        "previous": "3.0%",
+        "time_raw": "23:00"
+    },
+    {
+        "pid": "538301",
+        "title": "Retail Sales (YoY)  (Nov)",
+        "impact_raw": "bull1",
+        "currency": "IDR",
+        "actual": "",
+        "forecast": "",
+        "previous": "4.3%",
+        "time_raw": "23:00"
+    }
+]
+
+#######################################
+# PATH: Temp/events_scraper.py
+#######################################
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+from bs4 import BeautifulSoup
+import time
+import random
+import sys
+import os
+from datetime import datetime
+from typing import List, Dict, Any
+
+try:
+    from .default_logger import get_logger
+except ImportError:
+    from default_logger import get_logger
+
+logger = get_logger(__name__)
+
+# --- CONFIGURATION ---
+DEFAULT_TIMEOUT = 30
+MAX_RETRIES = 3
+BACKOFF_FACTOR = 2
+STATUS_FORCELIST = [403, 429, 500, 502, 503, 504]
+
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:122.0) Gecko/20100101 Firefox/122.0",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_2_1) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15"
+]
+
+def get_robust_session() -> requests.Session:
+    """Creates a session with retry logic and rotating User-Agents."""
+    session = requests.Session()
+    selected_ua = random.choice(USER_AGENTS)
+
+    session.headers.update({
+        "User-Agent": selected_ua,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+    })
+
+    retry_strategy = Retry(
+        total=MAX_RETRIES,
+        backoff_factor=BACKOFF_FACTOR,
+        status_forcelist=STATUS_FORCELIST,
+        allowed_methods=["POST", "GET"]
+    )
+    adapter = HTTPAdapter(max_retries=retry_strategy)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    return session
+
+
+def parse_investing_date(date_str: str) -> str:
+    """Parses 'Monday, January 12, 2026' into '2026-01-12'."""
+    try:
+        if "Waiting" in date_str: return ""
+        clean_str = date_str.strip()
+        dt = datetime.strptime(clean_str, "%A, %B %d, %Y")
+        return dt.strftime("%Y-%m-%d")
+    except ValueError:
+        return date_str
+
+
+def scrape_events(date_from: str, date_to: str, pages: int = 3) -> List[Dict[str, Any]]:
+    """
+    Scrapes economic events for a given date range.
+    Handles 'Preliminary' (P) and 'Revised' (R) icons aggressively.
+    """
+    base_url = "https://www.investing.com/economic-calendar/"
+    ajax_url = "https://www.investing.com/economic-calendar/Service/getCalendarFilteredData"
+
+    post_headers = {
+        "X-Requested-With": "XMLHttpRequest",
+        "Referer": base_url,
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Origin": "https://www.investing.com"
+    }
+
+    all_events = []
+    seen_pids = set()
+    current_sticky_date = ""
+
+    session = get_robust_session()
+
+    logger.info(f"Starting Events Scrape: {date_from} to {date_to}")
+
+    # --- STEP 1: WARM-UP SESSION ---
+    try:
+        logger.info("Warming up session (acquiring cookies)...")
+        session.get(base_url, timeout=DEFAULT_TIMEOUT)
+        time.sleep(random.uniform(1.0, 2.0))
+    except Exception as e:
+        logger.warning(f"Session warm-up warning (continuing anyway): {e}")
+
+    # --- STEP 2: SCRAPE PAGES ---
+    for page in range(pages):
+        payload = {
+            "dateFrom": date_from,
+            "dateTo": date_to,
+            "timeZone": "8",  # 8 = London/Europe
+            "currentTab": "custom",
+            "limit_from": str(page),
+            "submitFilters": "1"
+        }
+
+        try:
+            logger.info(f"Fetching Events Page {page}...")
+
+            response = session.post(ajax_url, data=payload, headers=post_headers, timeout=DEFAULT_TIMEOUT)
+            response.raise_for_status()
+
+            data_json = response.json()
+            html_fragment = data_json.get('data', '')
+
+            if not html_fragment:
+                logger.info("No HTML fragment returned. Stopping pagination.")
+                break
+
+            soup = BeautifulSoup(html_fragment, 'html.parser')
+            rows = soup.find_all("tr")
+
+            for row in rows:
+                row_classes = row.get("class", [])
+                row_id = str(row.get("id", ""))
+
+                # --- Date Logic ---
+                raw_date_text = ""
+                if 'theDay' in row_classes:
+                    raw_date_text = row.get_text(strip=True)
+                elif "dateHeader" in row_id:
+                    raw_date_text = row.get_text(strip=True)
+                else:
+                    date_cell = row.find("td", class_="theDay")
+                    if date_cell:
+                        raw_date_text = date_cell.get_text(strip=True)
+
+                if raw_date_text:
+                    current_sticky_date = parse_investing_date(raw_date_text)
+                    continue
+
+                # --- Event Logic ---
+                if 'js-event-item' in row_classes:
+                    pid = row.get("id", "").replace("eventRowId_", "")
+                    if pid and pid not in seen_pids:
+                        seen_pids.add(pid)
+
+                        # Clean Impact
+                        raw_impact = "1"
+                        sentiment_td = row.find("td", class_="sentiment")
+                        if sentiment_td:
+                            img_key = sentiment_td.get("data-img_key", "")
+                            clean_impact = img_key.replace("bull", "").replace("grayFull", "0")
+                            if clean_impact.isdigit():
+                                raw_impact = clean_impact
+
+                        def get_text_safe(class_name):
+                            el = row.find("td", class_=class_name)
+                            return el.get_text(strip=True) if el else ""
+
+                        # --- ROBUST TITLE LOGIC ---
+                        title_cell = row.find("td", class_="event")
+                        title_text = "N/A"
+
+                        if title_cell:
+                            title_text = title_cell.get_text(strip=True)
+                            spans = title_cell.find_all("span")
+                            is_prelim = False
+                            is_revised = False
+
+                            for span in spans:
+                                txt = span.get_text(strip=True)
+                                classes = span.get("class", [])
+                                if txt == "P" or "smallGrayP" in classes:
+                                    is_prelim = True
+                                if txt == "R" or "smallGrayR" in classes:
+                                    is_revised = True
+
+                            if is_prelim:
+                                if "(Preliminary)" not in title_text:
+                                    if title_text.startswith("P "): title_text = title_text[2:]
+                                    title_text = f"(Preliminary) {title_text}"
+
+                            if is_revised:
+                                if "(Revised)" not in title_text:
+                                    if title_text.startswith("R "): title_text = title_text[2:]
+                                    title_text = f"(Revised) {title_text}"
+
+                        all_events.append({
+                            "pid": pid,
+                            "date": current_sticky_date,
+                            "title": title_text,
+                            "impact_raw": raw_impact,
+                            "currency": row.find("td", class_="flagCur").get_text(strip=True) if row.find("td", class_="flagCur") else "",
+                            "actual": get_text_safe("bold"),
+                            "forecast": get_text_safe("fore"),
+                            "previous": get_text_safe("prev"),
+                            "time_raw": get_text_safe("js-time"),
+                            "source": "Investing.com",
+                            "source_url": "https://uk.investing.com/economic-calendar"
+                        })
+
+            time.sleep(random.uniform(2.0, 5.0))
+
+        except requests.exceptions.RetryError:
+            logger.critical(f"CRITICAL: Max retries exceeded for Page {page}. Site may be blocking bot.")
+            break
+        except Exception as e:
+            logger.error(f"Event scrape failed on page {page}: {e}")
+            break
+
+    logger.info(f"Scrape Complete. Total Events Found: {len(all_events)}")
+    return all_events
+
+#######################################
+# PATH: Temp/holiday_discovery.json
+#######################################
+[]
+
+#######################################
+# PATH: Temp/holiday_scraper.py
+#######################################
+import requests
+from bs4 import BeautifulSoup
+import time
+from typing import List, Dict, Any
+
+
+def scrape_holidays(year: int = 2026) -> List[Dict[str, Any]]:
+    """
+    Scrapes market holidays using the proven 'Sticky Date' logic.
+    Includes session warm-up to bypass bot protection.
+    """
+    session = requests.Session()
+    base_inv = "https://www.investing.com"
+    ajax_url = f"{base_inv}/holiday-calendar/Service/getCalendarFilteredData"
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        "X-Requested-With": "XMLHttpRequest",
+        "Referer": f"{base_inv}/holiday-calendar/",
+        "Origin": base_inv,
+        "Sec-Fetch-Site": "same-origin"
+    }
+
+    print(f"--- Starting Holiday Scrape ({year}) ---")
+
+    # 1. Warm-up Session (Critical for Holidays)
+    try:
+        session.get(f"{base_inv}/holiday-calendar/", headers=headers, timeout=30)
+    except Exception as e:
+        print(f"Session warm-up warning: {e}")
+
+    all_holidays = []
+
+    # Scrape first 5 pages (usually sufficient for a year's overview)
+    for page in range(5):
+        payload = {
+            "dateFrom": f"{year}-01-01",
+            "dateTo": f"{year}-12-31",
+            "country": "",
+            "currentTab": "custom",
+            "limit_from": str(page),
+            "showMore": "true",
+            "submitFilters": "1",
+            "byHandler": "true"
+        }
+
+        try:
+            print(f"Fetching Holiday Page {page}...")
+            response = session.post(ajax_url, data=payload, headers=headers, timeout=60)
+            html_fragment = response.json().get('data', '')
+
+            if not html_fragment or "No results found" in html_fragment:
+                break
+
+            soup = BeautifulSoup(html_fragment, 'html.parser')
+            rows = soup.find_all("tr")
+
+            current_date = ""
+            for row in rows:
+                # Logic: Sticky Date Header
+                if 'theDay' in row.get('class', []):
+                    current_date = row.get_text(strip=True)
+                    continue
+
+                tds = row.find_all("td")
+                if len(tds) >= 4:
+                    country = tds[1].get_text(strip=True)
+                    market = tds[2].get_text(strip=True)
+                    title = tds[3].get_text(strip=True)
+                    status = tds[4].get_text(strip=True) if len(tds) > 4 else "Closed"
+
+                    # Skip if no date has been found yet
+                    if not current_date:
+                        continue
+
+                    pid = f"{current_date}-{country}-{market}-{title}".replace(" ", "-").lower()
+
+                    all_holidays.append({
+                        "pid": pid,
+                        "date": current_date,
+                        "country": country,
+                        "market": market,
+                        "title": title,
+                        "status": status
+                    })
+            time.sleep(1.5)
+
+        except Exception as e:
+            print(f"Holiday scrape failed on page {page}: {e}")
+            break
+
+    return all_holidays
+
+
+if __name__ == "__main__":
+    # Test run when executed directly
+    import json
+
+    data = scrape_holidays(year=2026)
+    print(json.dumps(data[:3], indent=2))
+
+#######################################
+# PATH: Temp/hol_scraper.py
+#######################################
+import requests
+from bs4 import BeautifulSoup
+import json
+import time
+from datetime import datetime, timezone
+
+
+def original_logic_scraper(year: int = 2026):
+    session = requests.Session()
+    base_inv = "https://www.investing.com"
+    ajax_url = f"{base_inv}/holiday-calendar/Service/getCalendarFilteredData"
+
+    # Precise headers from your successful capture
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        "X-Requested-With": "XMLHttpRequest",
+        "Accept": "application/json, text/javascript, */*; q=0.01",
+        "Referer": f"{base_inv}/holiday-calendar/",
+        "Origin": base_inv,
+        "Sec-Fetch-Site": "same-origin"
+    }
+
+    print("Step 1: Warming session...")
+    try:
+        # We increase the timeout here to handle slow local connections
+        session.get(f"{base_inv}/holiday-calendar/", headers=headers, timeout=30)
+    except Exception as e:
+        print(f"Warm-up failed: {e}")
+
+    all_holidays = []
+
+    # Loop through the pages as you saw in your network tab
+    for page in range(5):
+        print(f"Step 2: Fetching Page {page}...")
+
+        # Payload matching image_600d1f.png exactly
+        payload = {
+            "dateFrom": f"{year}-01-01",
+            "dateTo": f"{year}-12-31",
+            "country": "",
+            "currentTab": "custom",
+            "limit_from": str(page),
+            "showMore": "true",
+            "submitFilters": "1",
+            "byHandler": "true"
+        }
+
+        try:
+            # Added a 60-second timeout to mitigate local network lag
+            response = session.post(ajax_url, data=payload, headers=headers, timeout=60)
+            response.raise_for_status()
+
+            data_json = response.json()
+            html_fragment = data_json.get('data', '')
+
+            if not html_fragment or "No results found" in html_fragment:
+                break
+
+            soup = BeautifulSoup(html_fragment, 'html.parser')
+            rows = soup.find_all("tr")
+
+            current_date = ""
+            for row in rows:
+                # Sticky Date Logic from your KB
+                if 'theDay' in row.get('class', []):
+                    current_date = row.get_text(strip=True)
+                    continue
+
+                tds = row.find_all("td")
+                if len(tds) >= 4:
+                    # Index-based extraction from your KB script
+                    country = tds[1].get_text(strip=True)
+                    market = tds[2].get_text(strip=True)
+                    title = tds[3].get_text(strip=True)
+                    status = tds[4].get_text(strip=True) if len(tds) > 4 else "Closed"
+
+                    # Composite ID logic
+                    pid = f"{current_date}-{country}-{market}-{title}".replace(" ", "-").lower()
+
+                    all_holidays.append({
+                        "pid": pid,
+                        "date": current_date,
+                        "country": country,
+                        "market": market,
+                        "title": title,
+                        "status": status
+                    })
+
+            time.sleep(2)  # Increased delay to avoid local throttling
+
+        except Exception as e:
+            print(f"Failed at Page {page}: {e}")
+            break
+
+    return all_holidays
+
+if __name__ == "__main__":
+    results = original_logic_scraper()
+    print(f"\nCaptured {len(results)} holidays.")
+    if results:
+        print(json.dumps(results[:3], indent=4))
+
